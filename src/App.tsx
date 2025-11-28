@@ -10,6 +10,7 @@ import { publicClient, rhinestoneConfig } from "./clients";
 import { WebAuthnSigner } from "./passkeySigner";
 import "./App.css";
 import { createRhinestoneAccount, type RhinestoneAccount, type Session } from "@rhinestone/sdk";
+import { installModule } from "@rhinestone/sdk/actions";
 import { enableSession } from "@rhinestone/sdk/actions/smart-sessions";
 
 // ABI for Nexus/Safe to check for installed modules
@@ -30,6 +31,7 @@ const MODULE_ABI = [
 ] as const;
 
 const SENTINEL_ADDRESS = "0x0000000000000000000000000000000000000001";
+const SMART_SESSIONS_VALIDATOR_ADDRESS = "0x00000000008bdaba73cd9815d79069c247eb4bda";
 
 // Helper to handle BigInt serialization for LocalStorage
 const serializeSession = (key: Hex, session: any) => {
@@ -204,10 +206,21 @@ function App() {
       localStorage.setItem("demo_session_data", serializeSession(sessionPrivateKey, sessionForStorage));
       setHasStoredSession(true);
 
-      addLog("Sending transaction to enable session on-chain...");
+      addLog("Sending transaction to install Smart Sessions module and enable session...");
+
+      // We batch two actions:
+      // 1. Install the Smart Sessions Validator module on the account (required to use it for signatures)
+      // 2. Enable the specific session permission on the validator
       const result = await rhinestoneAccount.sendTransaction({
         chain: publicClient.chain,
-        calls: [enableSession(session)],
+        calls: [
+          installModule({
+            type: "validator",
+            address: SMART_SESSIONS_VALIDATOR_ADDRESS,
+            initData: "0x", // No init data required for installation
+          }),
+          enableSession(session)
+        ],
         sponsored: true,
       });
 
