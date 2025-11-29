@@ -9,11 +9,21 @@ import { hexToBytes, bytesToBigInt } from "viem";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { publicClient, rhinestoneConfig } from "./clients";
 import { WebAuthnSigner } from "./passkeySigner";
-import { addOwner as addPasskeyOwner } from "@rhinestone/sdk/actions/passkeys";
+import { addOwner as addPasskeyOwner, changeThreshold } from "@rhinestone/sdk/actions/passkeys";
 import "./App.css";
 import { createRhinestoneAccount, type RhinestoneAccount, type Session } from "@rhinestone/sdk";
 import { enableSession } from "@rhinestone/sdk/actions/smart-sessions";
 import { installModule } from "@rhinestone/sdk/actions";
+
+type TxProposal = {
+  id: string;
+  description: string;
+  calls: {
+    to: Address;
+    value: bigint;
+    data: Hex;
+  }[];
+};
 
 // ABI for Nexus/Safe to check for installed modules
 const MODULE_ABI = [
@@ -57,6 +67,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [moduleStatus, setModuleStatus] = useState<{ hasValidator: boolean; hasExecutor: boolean } | null>(null);
   const [hasStoredSession, setHasStoredSession] = useState(false);
+  const [pendingProposal, setPendingProposal] = useState<TxProposal | null>(null);
+
 
   const addLog = (msg: string) => setLogs((prev) => [...prev, msg]);
 
@@ -459,6 +471,118 @@ function App() {
     }
   };
 
+  const setThresholdToTwo = async () => {
+    if (!rhinestoneAccount) return;
+    setLoading(true);
+
+    try {
+      addLog("Updating passkey multisig threshold to 2-of-N...");
+
+      const tx = await rhinestoneAccount.sendTransaction({
+        chain: publicClient.chain,
+        calls: [changeThreshold(2)], // 2-of-N
+        sponsored: true,
+      });
+
+      addLog(`changeThreshold intent sent! ID: ${tx.id}`);
+      await rhinestoneAccount.waitForExecution(tx);
+
+      addLog("✅ Threshold updated to 2-of-N. You now need 2 valid passkey signatures per tx.");
+    } catch (e: any) {
+      console.error("setThresholdToTwo error:", e);
+      addLog(`Error changing threshold: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshOwners = async () => {
+    if (!rhinestoneAccount) return;
+
+    try {
+      const owners = await rhinestoneAccount.getOwners(publicClient.chain);
+      addLog(
+        `Owners: ${owners?.accounts.length} | threshold: ${owners?.threshold.toString()}`
+      );
+    } catch (e: any) {
+      console.error("refreshOwners error:", e);
+      addLog(`Error fetching owners: ${e.message}`);
+    }
+  };
+
+  const proposeTransfer = async () => {
+    if (!accountAddress) {
+      addLog("Cannot propose tx: account address missing.");
+      return;
+    }
+
+    const transferAmount = parseEther("0.00002");
+    const target = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" as Address; // vitalik.eth
+
+    const proposal: TxProposal = {
+      id: `proposal-${Date.now()}`,
+      description: `Send ${formatEther(transferAmount)} ETH to ${target.slice(0, 6)}...`,
+      calls: [
+        {
+          to: target,
+          value: transferAmount,
+          data: "0x" as Hex,
+        },
+      ],
+    };
+
+    setPendingProposal(proposal);
+    addLog(`📄 Proposal created: ${proposal.id} — ${proposal.description}`);
+
+    // In a real app, you'd also sync this proposal to a backend / DB
+    // so User 2 can see it from a different device.
+  };
+
+  const approveAndExecuteProposal = async () => {
+    if (!rhinestoneAccount) {
+      addLog("No Rhinestone account available.");
+      return;
+    }
+    if (!pendingProposal) {
+      addLog("No pending proposal to execute.");
+      return;
+    }
+    if (!signer) {
+      addLog("No active passkey signer.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await logCurrentBalance("Balance BEFORE proposed tx");
+
+      addLog(
+        `User approving proposal ${pendingProposal.id} — ${pendingProposal.description}`
+      );
+
+      const result = await rhinestoneAccount.sendTransaction({
+        chain: publicClient.chain,
+        calls: pendingProposal.calls,
+        // For passkeys multisig the SDK will route to the WebAuthn validator.
+        // For threshold=1, this single signer is enough.
+        sponsored: true,
+      });
+
+      addLog(`Multisig tx sent! Intent ID: ${result.id}`);
+      await rhinestoneAccount.waitForExecution(result);
+      addLog("✅ Proposed transaction executed.");
+
+      await logCurrentBalance("Balance AFTER proposed tx");
+
+      setPendingProposal(null);
+    } catch (e: any) {
+      console.error("approveAndExecuteProposal error:", e);
+      addLog(`Error executing proposal: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const checkModules = async () => {
     if (!accountAddress) return;
     setLoading(true);
@@ -555,9 +679,27 @@ function App() {
               Verify Modules
             </button>
 
-            {/* NEW BUTTON */}
             <button onClick={addExtraPasskeyOwner} disabled={loading || !rhinestoneAccount}>
               Add Extra Passkey Owner (Multisig)
+            </button>
+
+            {/* NEW: Multisig config */}
+            <button onClick={setThresholdToTwo} disabled={loading || !rhinestoneAccount}>
+              Set Threshold to 2-of-N
+            </button>
+            <button onClick={refreshOwners} disabled={loading || !rhinestoneAccount}>
+              Refresh Owners / Threshold
+            </button>
+
+            {/* NEW: Proposal / approval */}
+            <button onClick={proposeTransfer} disabled={loading || !rhinestoneAccount}>
+              Propose Transfer (User 1)
+            </button>
+            <button
+              onClick={approveAndExecuteProposal}
+              disabled={loading || !rhinestoneAccount || !pendingProposal}
+            >
+              Approve & Execute Proposal (User 2)
             </button>
           </div>
         </div>
