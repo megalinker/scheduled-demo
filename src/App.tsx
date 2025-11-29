@@ -5,9 +5,11 @@ import {
   formatEther,
   type Hex
 } from "viem";
+import { hexToBytes, bytesToBigInt } from "viem";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { publicClient, rhinestoneConfig } from "./clients";
 import { WebAuthnSigner } from "./passkeySigner";
+import { addOwner as addPasskeyOwner } from "@rhinestone/sdk/actions/passkeys";
 import "./App.css";
 import { createRhinestoneAccount, type RhinestoneAccount, type Session } from "@rhinestone/sdk";
 import { enableSession } from "@rhinestone/sdk/actions/smart-sessions";
@@ -38,6 +40,13 @@ const serializeSession = (key: Hex, session: any) => {
   return JSON.stringify({ key, session }, (_, v) =>
     typeof v === 'bigint' ? v.toString() : v
   );
+};
+
+const getPasskeyCoords = (publicKey: Hex) => {
+  const bytes = hexToBytes(publicKey); // Uint8Array
+  const x = bytesToBigInt(bytes.slice(0, 32));
+  const y = bytesToBigInt(bytes.slice(32, 64));
+  return { x, y };
 };
 
 function App() {
@@ -303,6 +312,63 @@ function App() {
     }
   };
 
+  const addExtraPasskeyOwner = async () => {
+    if (!rhinestoneAccount) return;
+    setLoading(true);
+
+    try {
+      addLog("Creating a new passkey for an extra owner...");
+
+      // Create a *new* passkey credential (on this or another device)
+      const newSigner = await WebAuthnSigner.create(
+        `demo-coowner-${Date.now()}`
+      );
+
+      addLog(
+        `New passkey co-owner registered. Credential ID: ${newSigner.credentialId.slice(
+          0,
+          10
+        )}...`
+      );
+
+      // Convert the passkey's public key into (x, y) coords
+      const { x: pubKeyX, y: pubKeyY } = getPasskeyCoords(
+        newSigner.publicKey as Hex
+      );
+
+      const requiresUV = false; // or true if you want to enforce user verification
+
+      addLog("Sending tx to add passkey co-owner to the multisig...");
+
+      // On-chain: add this passkey as an owner in the WebAuthn validator
+      const tx = await rhinestoneAccount.sendTransaction({
+        chain: publicClient.chain,
+        calls: [addPasskeyOwner(pubKeyX, pubKeyY, requiresUV)],
+        sponsored: true,
+      });
+
+      addLog(`addOwner intent sent! ID: ${tx.id}`);
+      await rhinestoneAccount.waitForExecution(tx);
+
+      addLog("✅ Extra passkey owner added to the account (multisig-ready).");
+
+      // OPTIONAL: if/when you want 2-of-N real multisig, bump the threshold:
+      // addLog("Updating passkey multisig threshold to 2-of-N...");
+      // const thresholdTx = await rhinestoneAccount.sendTransaction({
+      //   chain: publicClient.chain,
+      //   calls: [changeThreshold(2)],
+      //   sponsored: true,
+      // });
+      // await rhinestoneAccount.waitForExecution(thresholdTx);
+      // addLog("✅ Threshold updated to 2-of-N.");
+    } catch (e: any) {
+      console.error("Full error object (addExtraPasskeyOwner):", e);
+      addLog(`Error adding passkey owner: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // 4. Execute using the Stored Session (No Passkey needed)
   const executeScheduledTransfer = async () => {
     if (!rhinestoneAccount) return;
@@ -487,6 +553,11 @@ function App() {
 
             <button onClick={checkModules} disabled={loading || !rhinestoneAccount}>
               Verify Modules
+            </button>
+
+            {/* NEW BUTTON */}
+            <button onClick={addExtraPasskeyOwner} disabled={loading || !rhinestoneAccount}>
+              Add Extra Passkey Owner (Multisig)
             </button>
           </div>
         </div>
