@@ -84,22 +84,30 @@ function App() {
       setSigner(webAuthnSigner);
       addLog(`Passkey authenticated. Credential ID: ${webAuthnSigner.credentialId.slice(0, 10)}...`);
 
-      addLog("Initializing Rhinestone SDK and Nexus Account...");
+      addLog("Initializing Rhinestone SDK and Safe Account...");
 
       const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
-        account: { type: 'nexus' },
+        account: {
+          // Use Safe instead of Nexus.
+          // In Rhinestone’s types, SAFE = “Safe using the Safe 7579 adapter”.
+          // That’s what gives you ERC-7579 + 4337 compatibility.
+          type: 'safe',
+        },
         owners: {
           type: 'passkey',
           accounts: [webAuthnSigner],
         },
-        sessions: [], // This ensures the Smart Sessions validator is installed upon deployment
+        // Keep this – it wires in the Smart Sessions validator so your
+        // enableSession / session flows keep working.
+        sessions: [],
       });
+
 
       setRhinestoneAccount(account);
       const address = account.getAddress();
       setAccountAddress(address);
-      addLog(`Nexus Address Calculated: ${address}`);
+      addLog(`Safe Account Address: ${address}`);
 
       // Log initial balance upon connection
       const balance = await publicClient.getBalance({ address });
@@ -430,7 +438,7 @@ function App() {
   return (
     <div className="app-container">
       <header>
-        <h1>Nexus + Passkeys + Sessions</h1>
+        <h1>Safe + Passkeys + Sessions</h1>
         <div className="subtitle">Gasless Modular Smart Account Demo</div>
       </header>
 
@@ -456,7 +464,7 @@ function App() {
           <h3>Account Actions</h3>
 
           <div className="address-container">
-            <span className="label">Nexus Address:</span>
+            <span className="label">Safe Address:</span>
             <code className="address-text">{accountAddress || "Calculating..."}</code>
           </div>
 
