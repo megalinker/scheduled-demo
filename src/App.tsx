@@ -45,17 +45,33 @@ const MODULE_ABI = [
 const SENTINEL_ADDRESS = "0x0000000000000000000000000000000000000001";
 const SMART_SESSIONS_VALIDATOR_ADDRESS = "0x00000000008bdaba73cd9815d79069c247eb4bda";
 
+// --- DEBUG HELPER ---
+const debugLog = (label: string, data?: any) => {
+  if (data === undefined) {
+    console.log(`%c[DEBUG] ${label}`, "color: #00bcd4; font-weight: bold;");
+  } else {
+    console.log(
+      `%c[DEBUG] ${label}:`, "color: #00bcd4; font-weight: bold;",
+      JSON.stringify(data, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2)
+    );
+  }
+};
+
 // Helper to handle BigInt serialization for LocalStorage
 const serializeSession = (key: Hex, session: any) => {
-  return JSON.stringify({ key, session }, (_, v) =>
+  const data = JSON.stringify({ key, session }, (_, v) =>
     typeof v === 'bigint' ? v.toString() : v
   );
+  debugLog("Serialized Session Data for Storage", data);
+  return data;
 };
 
 const getPasskeyCoords = (publicKey: Hex) => {
+  debugLog("Parsing Passkey Public Key", publicKey);
   const bytes = hexToBytes(publicKey); // Uint8Array
   const x = bytesToBigInt(bytes.slice(0, 32));
   const y = bytesToBigInt(bytes.slice(32, 64));
+  debugLog("Passkey Coords", { x, y });
   return { x, y };
 };
 
@@ -75,7 +91,10 @@ function App() {
   // Check for stored session on load
   useEffect(() => {
     const stored = localStorage.getItem("demo_session_data");
-    if (stored) setHasStoredSession(true);
+    if (stored) {
+      debugLog("Found existing session in localStorage", stored);
+      setHasStoredSession(true);
+    }
   }, []);
 
   // --- NEW HELPER: Fetch Balance ---
@@ -85,6 +104,7 @@ function App() {
       const balance = await publicClient.getBalance({ address: accountAddress });
       const formatted = formatEther(balance);
       addLog(`💰 ${label}: ${formatted} ETH`);
+      debugLog(`Balance [${label}]`, { raw: balance, formatted });
       return balance;
     } catch (e) {
       addLog(`Failed to fetch balance: ${e}`);
@@ -96,38 +116,49 @@ function App() {
   const handleAuth = async (mode: "register" | "login") => {
     try {
       setLoading(true);
+      debugLog(`--- AUTH STARTED (${mode}) ---`);
 
       const uniqueUsername = `demo-user-${Date.now()}`;
+      debugLog("Username", uniqueUsername);
+
       const webAuthnSigner = mode === "register"
         ? await WebAuthnSigner.create(uniqueUsername)
         : await WebAuthnSigner.login();
 
       setSigner(webAuthnSigner);
+      debugLog("WebAuthn Signer Ready", {
+        credentialId: webAuthnSigner.credentialId,
+        publicKey: webAuthnSigner.publicKey
+      });
+
       addLog(`Passkey authenticated. Credential ID: ${webAuthnSigner.credentialId.slice(0, 10)}...`);
 
       addLog("Initializing Rhinestone SDK and Safe Account...");
 
-      const account = await createRhinestoneAccount({
+      const accountConfig = {
         ...rhinestoneConfig,
         account: {
-          // Use Safe instead of Nexus.
-          // In Rhinestone’s types, SAFE = “Safe using the Safe 7579 adapter”.
-          // That’s what gives you ERC-7579 + 4337 compatibility.
           type: 'safe',
         },
         owners: {
           type: 'passkey',
           accounts: [webAuthnSigner],
         },
-        // Keep this – it wires in the Smart Sessions validator so your
-        // enableSession / session flows keep working.
         sessions: [],
-      });
+      };
 
+      debugLog("createRhinestoneAccount Config", accountConfig);
+
+      // @ts-ignore
+      const account = await createRhinestoneAccount(accountConfig);
+
+      debugLog("Rhinestone Account Object Created", account);
 
       setRhinestoneAccount(account);
       const address = account.getAddress();
       setAccountAddress(address);
+
+      debugLog("Calculated Smart Account Address", address);
       addLog(`Safe Account Address: ${address}`);
 
       // Log initial balance upon connection
@@ -148,9 +179,12 @@ function App() {
   const sendFirstTx = async () => {
     if (!rhinestoneAccount || !accountAddress) return;
     setLoading(true);
+    debugLog("--- DEPLOY ACCOUNT CLICKED ---");
+
     try {
       addLog("Checking if account is deployed...");
       const code = await publicClient.getBytecode({ address: accountAddress });
+      debugLog("Account Bytecode", code);
 
       if (!code) {
         addLog("Account not deployed yet. Deployment will happen with this transaction.");
@@ -162,20 +196,26 @@ function App() {
 
       addLog("Sending a simple transaction to trigger deployment...");
 
-      const result = await rhinestoneAccount.sendTransaction({
+      const txPayload = {
         chain: publicClient.chain,
         calls: [{
           to: accountAddress,
           value: 0n,
-          data: '0x',
+          data: '0x' as Hex,
         }],
         sponsored: true,
-      });
+      };
+      debugLog("Deploy Transaction Payload", txPayload);
 
+      const result = await rhinestoneAccount.sendTransaction(txPayload);
+
+      debugLog("Deploy Transaction Result (UserOp Hash)", result);
       addLog(`Transaction sent! Intent ID: ${result.id}`);
       addLog("Waiting for execution...");
 
-      await rhinestoneAccount.waitForExecution(result);
+      const receipt = await rhinestoneAccount.waitForExecution(result);
+      debugLog("Deploy Execution Receipt", receipt);
+
       addLog("Transaction confirmed. Account is deployed.");
     } catch (e: any) {
       console.error("Full error object:", e);
@@ -189,6 +229,7 @@ function App() {
   const installScheduledTransfer = async () => {
     if (!rhinestoneAccount || !accountAddress) return;
     setLoading(true);
+    debugLog("--- INSTALL SESSION CLICKED ---");
 
     try {
       // 1) Check balance (same as before)
@@ -205,7 +246,10 @@ function App() {
       addLog("Generating new session key...");
 
       const sessionPrivateKey = generatePrivateKey();
+      debugLog("🔑 GENERATED SESSION PRIVATE KEY (Ephemeral)", sessionPrivateKey);
+
       const sessionKeyAccount = privateKeyToAccount(sessionPrivateKey);
+      debugLog("Session Account Address", sessionKeyAccount.address);
 
       const targetAddress =
         "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"; // vitalik.eth
@@ -237,6 +281,8 @@ function App() {
         ],
       };
 
+      debugLog("Constructed Session Object", session);
+
       // 3) Check if Smart Sessions validator is already installed
       addLog("Checking if Smart Sessions validator is already installed...");
       let validators: Address[] = [];
@@ -251,8 +297,9 @@ function App() {
         });
 
         validators = modules as Address[];
+        debugLog("Fetched On-Chain Validators", validators);
       } catch (err) {
-        // If the read fails (e.g. account just deployed), assume no validators yet
+        debugLog("Error reading validators (expected if undeployed)", err);
         addLog(
           "Could not read validators (account may be freshly deployed). Assuming no Smart Sessions validator installed."
         );
@@ -268,13 +315,13 @@ function App() {
         addLog(
           "Smart Sessions validator not found. Installing it on the account..."
         );
-        calls.push(
-          installModule({
-            type: "validator",
-            address: SMART_SESSIONS_VALIDATOR_ADDRESS,
-            initData: "0x", // No init data required
-          })
-        );
+        const installCall = installModule({
+          type: "validator",
+          address: SMART_SESSIONS_VALIDATOR_ADDRESS,
+          initData: "0x", // No init data required
+        });
+        debugLog("Adding installModule Call", installCall);
+        calls.push(installCall);
       } else {
         addLog(
           "Smart Sessions validator already installed. Skipping installation."
@@ -282,20 +329,29 @@ function App() {
       }
 
       addLog("Enabling session on-chain...");
-      calls.push(enableSession(session));
+      const enableSessionCall = enableSession(session);
+      debugLog("Adding enableSession Call", enableSessionCall);
+      calls.push(enableSessionCall);
 
       addLog(
         "Sending transaction to install (if needed) and enable the session..."
       );
 
-      const result = await rhinestoneAccount.sendTransaction({
+      const txPayload = {
         chain: publicClient.chain,
         calls,
         sponsored: true,
-      });
+      };
+      debugLog("Session Installation TX Payload", txPayload);
 
+      const result = await rhinestoneAccount.sendTransaction(txPayload);
+
+      debugLog("Session Installation Result (UserOp Hash)", result);
       addLog(`Installation / enableSession intent sent! ID: ${result.id}`);
-      await rhinestoneAccount.waitForExecution(result);
+
+      const receipt = await rhinestoneAccount.waitForExecution(result);
+      debugLog("Session Installation Receipt", receipt);
+
       addLog(
         "✅ Session Installed / Enabled. You can now execute the transfer without the Passkey."
       );
@@ -306,6 +362,8 @@ function App() {
         ...session,
         owners: { type: "ecdsa", accounts: [] }, // strip accounts before storing
       };
+
+      debugLog("Session Object stripped for storage", sessionForStorage);
 
       localStorage.setItem(
         "demo_session_data",
@@ -364,15 +422,6 @@ function App() {
 
       addLog("✅ Extra passkey owner added to the account (multisig-ready).");
 
-      // OPTIONAL: if/when you want 2-of-N real multisig, bump the threshold:
-      // addLog("Updating passkey multisig threshold to 2-of-N...");
-      // const thresholdTx = await rhinestoneAccount.sendTransaction({
-      //   chain: publicClient.chain,
-      //   calls: [changeThreshold(2)],
-      //   sponsored: true,
-      // });
-      // await rhinestoneAccount.waitForExecution(thresholdTx);
-      // addLog("✅ Threshold updated to 2-of-N.");
     } catch (e: any) {
       console.error("Full error object (addExtraPasskeyOwner):", e);
       addLog(`Error adding passkey owner: ${e.message}`);
@@ -385,14 +434,21 @@ function App() {
   const executeScheduledTransfer = async () => {
     if (!rhinestoneAccount) return;
     setLoading(true);
+    debugLog("--- EXECUTE SESSION CLICKED ---");
 
     try {
       addLog("Retrieving session from storage...");
       const storedData = localStorage.getItem("demo_session_data");
+      debugLog("Raw Stored Data", storedData);
+
       if (!storedData) throw new Error("No session found in storage");
 
       const { key, session: sessionConfig } = JSON.parse(storedData);
+      debugLog("Parsed Storage Data (Key)", key);
+      debugLog("Parsed Storage Data (Config)", sessionConfig);
+
       const sessionOwner = privateKeyToAccount(key);
+      debugLog("Restored Session Account Address", sessionOwner.address);
 
       // Rebuild the Session with proper BigInts & owner
       const parsedActions =
@@ -414,12 +470,9 @@ function App() {
         actions: parsedActions,
       };
 
-      // Take target + amount from the session itself (so it ALWAYS matches)
-      if (!session.actions || session.actions.length === 0) {
-        throw new Error("Session has no actions configured");
-      }
+      debugLog("Fully Reconstructed Session Object", session);
 
-      // Take target + amount from the first action
+      // Take target + amount from the session itself (so it ALWAYS matches)
       if (!session.actions || session.actions.length === 0) {
         throw new Error("Session has no actions configured");
       }
@@ -431,12 +484,14 @@ function App() {
         (action.policies.find((p: any) => p.type === "value-limit")?.limit as bigint) ??
         parseEther("0.00001");
 
+      debugLog("Extracted Action Details", { targetAddress, transferAmount });
+
       // --- LOG BALANCE BEFORE ---
       await logCurrentBalance("Balance BEFORE Transfer");
 
       addLog("Executing transfer using Session Key...");
 
-      const result = await rhinestoneAccount.sendUserOperation({
+      const userOpPayload = {
         chain: publicClient.chain,
         calls: [
           {
@@ -450,11 +505,18 @@ function App() {
           type: "session",
           session,
         },
-      });
+      };
 
+      debugLog("sendUserOperation Payload", userOpPayload);
+
+      // @ts-ignore
+      const result = await rhinestoneAccount.sendUserOperation(userOpPayload);
+
+      debugLog("Execution Result (UserOp Hash)", result);
       addLog(`Execution sent via Session! UserOp Hash: ${result.hash}`);
 
-      await rhinestoneAccount.waitForExecution(result);
+      const receipt = await rhinestoneAccount.waitForExecution(result);
+      debugLog("Execution Receipt", receipt);
 
       addLog("✅ Transfer Successful! Verified via Smart Session.");
 
@@ -586,10 +648,12 @@ function App() {
   const checkModules = async () => {
     if (!accountAddress) return;
     setLoading(true);
+    debugLog("--- VERIFY MODULES CLICKED ---");
 
     try {
       addLog("Reading installed validators...");
       const code = await publicClient.getBytecode({ address: accountAddress });
+      debugLog("Account Bytecode", code);
 
       if (!code) {
         addLog("Account not deployed yet.");
@@ -603,10 +667,15 @@ function App() {
         args: [SENTINEL_ADDRESS as Address, 10n],
       });
 
+      debugLog("Raw Modules Response", modules);
+
       const validators = modules as Address[];
       const hasSmartSessionsValidator = validators.some(
         (m) => m.toLowerCase() === SMART_SESSIONS_VALIDATOR_ADDRESS.toLowerCase()
       );
+
+      debugLog("Parsed Validators List", validators);
+      debugLog("Smart Session Validator Detected?", hasSmartSessionsValidator);
 
       setModuleStatus({
         hasValidator: hasSmartSessionsValidator,
@@ -619,6 +688,7 @@ function App() {
         addLog(`Found validators: ${validators.join(", ")}`);
       }
     } catch (e: any) {
+      debugLog("Error checking modules", e);
       addLog(`Error checking modules: ${e.message}`);
     } finally {
       setLoading(false);
