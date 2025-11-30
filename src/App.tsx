@@ -138,10 +138,10 @@ function App() {
       const accountConfig = {
         ...rhinestoneConfig,
         account: {
-          type: 'safe',
+          type: 'safe' as const,
         },
         owners: {
-          type: 'passkey',
+          type: 'passkey' as const,
           accounts: [webAuthnSigner],
         },
         sessions: [],
@@ -149,7 +149,6 @@ function App() {
 
       debugLog("createRhinestoneAccount Config", accountConfig);
 
-      // @ts-ignore
       const account = await createRhinestoneAccount(accountConfig);
 
       debugLog("Rhinestone Account Object Created", account);
@@ -486,7 +485,6 @@ function App() {
 
       debugLog("Extracted Action Details", { targetAddress, transferAmount });
 
-      // --- LOG BALANCE BEFORE ---
       await logCurrentBalance("Balance BEFORE Transfer");
 
       addLog("Executing transfer using Session Key...");
@@ -502,14 +500,13 @@ function App() {
           },
         ],
         signers: {
-          type: "session",
+          type: "session" as const,
           session,
         },
       };
 
       debugLog("sendUserOperation Payload", userOpPayload);
 
-      // @ts-ignore
       const result = await rhinestoneAccount.sendUserOperation(userOpPayload);
 
       debugLog("Execution Result (UserOp Hash)", result);
@@ -520,7 +517,6 @@ function App() {
 
       addLog("✅ Transfer Successful! Verified via Smart Session.");
 
-      // --- LOG BALANCE AFTER ---
       await logCurrentBalance("Balance AFTER Transfer");
 
       localStorage.removeItem("demo_session_data");
