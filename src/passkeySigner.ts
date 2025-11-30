@@ -1,67 +1,56 @@
 import { createWebAuthnCredential, toWebAuthnAccount } from 'viem/account-abstraction';
 
-// Helper to log BigInts
-const jsonLog = (label: string, data: any) => {
-    console.log(`[PasskeySigner] ${label}:`, JSON.stringify(data, (_, v) =>
-        typeof v === 'bigint' ? v.toString() : v
-        , 2));
-};
+const USERS_STORAGE_KEY = "demo_app_users";
 
 export type WebAuthnSigner = ReturnType<typeof toWebAuthnAccount> & {
     credentialId: string;
 };
 
 export const WebAuthnSigner = {
-    // 1. Static method to Create/Register a new Passkey
-    async create(username: string): Promise<WebAuthnSigner> {
-        console.log(`[PasskeySigner] Creating new credential for user: ${username}`);
+    // Check if a user is already registered
+    isRegistered(username: string): boolean {
+        const store = JSON.parse(localStorage.getItem(USERS_STORAGE_KEY) || "{}");
+        return !!store[username];
+    },
 
-        // Use viem's native helper to create the credential
+    // Get raw credential (useful for adding User 2 as owner without logging them in)
+    getCredential(username: string) {
+        const store = JSON.parse(localStorage.getItem(USERS_STORAGE_KEY) || "{}");
+        return store[username];
+    },
+
+    // 1. Register a specific user (User 1 or User 2)
+    async register(username: string): Promise<WebAuthnSigner> {
+        console.log(`[PasskeySigner] Registering ${username}...`);
+
         const credential = await createWebAuthnCredential({
             name: username,
         });
 
-        jsonLog("Raw Created Credential", credential);
+        // Save to dictionary
+        const store = JSON.parse(localStorage.getItem(USERS_STORAGE_KEY) || "{}");
+        store[username] = credential;
+        localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(store));
 
-        // Store credential for future logins
-        localStorage.setItem("passkey_credential", JSON.stringify(credential));
-
-        // Create the Account compatible with permissionless/viem
         const account = toWebAuthnAccount({ credential });
 
-        jsonLog("Generated WebAuthn Account Object", {
-            type: account.type,
-            publicKey: account.publicKey,
-            id: account.id
-        });
-
-        // Return the account augmented with credentialId
         return {
             ...account,
             credentialId: credential.id,
         } as WebAuthnSigner;
     },
 
-    // 2. Static method to Login
-    async login(): Promise<WebAuthnSigner> {
-        console.log("[PasskeySigner] Attempting login...");
-        const stored = localStorage.getItem("passkey_credential");
+    // 2. Login as a specific user
+    async login(username: string): Promise<WebAuthnSigner> {
+        console.log(`[PasskeySigner] Logging in as ${username}...`);
+        const store = JSON.parse(localStorage.getItem(USERS_STORAGE_KEY) || "{}");
+        const credential = store[username];
 
-        if (!stored) {
-            console.error("[PasskeySigner] No credential found in localStorage");
-            throw new Error("No passkey found. Register first.");
+        if (!credential) {
+            throw new Error(`User ${username} not found. Please register first.`);
         }
 
-        const credential = JSON.parse(stored);
-        jsonLog("Retrieved Stored Credential", credential);
-
         const account = toWebAuthnAccount({ credential });
-
-        jsonLog("Reconstructed WebAuthn Account Object", {
-            type: account.type,
-            publicKey: account.publicKey,
-            id: account.id
-        });
 
         return {
             ...account,

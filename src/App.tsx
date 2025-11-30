@@ -1,792 +1,394 @@
 import { useState, useEffect } from "react";
 import {
   type Address,
-  parseEther,
   formatEther,
-  type Hex
+  type Hex,
+  toHex,
+  hexToBigInt
 } from "viem";
-import { hexToBytes, bytesToBigInt } from "viem";
-import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
+import { toWebAuthnAccount } from "viem/account-abstraction";
 import { publicClient, rhinestoneConfig } from "./clients";
 import { WebAuthnSigner } from "./passkeySigner";
-import { addOwner as addPasskeyOwner, changeThreshold } from "@rhinestone/sdk/actions/passkeys";
 import "./App.css";
-import { createRhinestoneAccount, type RhinestoneAccount, type Session } from "@rhinestone/sdk";
-import { enableSession } from "@rhinestone/sdk/actions/smart-sessions";
-import { installModule } from "@rhinestone/sdk/actions";
+import { createRhinestoneAccount, type RhinestoneAccount } from "@rhinestone/sdk";
 
-type TxProposal = {
-  id: string;
-  description: string;
-  calls: {
-    to: Address;
-    value: bigint;
-    data: Hex;
-  }[];
+// --- TYPES ---
+type StoredSafe = {
+  name: string;
+  address: Address;
+  salt: Hex; // Storing as Hex is fine, we convert to BigInt for usage
+  owners: string[]; // list of usernames
 };
 
-// ABI for Nexus/Safe to check for installed modules
-const MODULE_ABI = [
-  {
-    inputs: [
-      { internalType: "address", name: "cursor", type: "address" },
-      { internalType: "uint256", name: "size", type: "uint256" }
-    ],
-    name: "getValidatorsPaginated",
-    outputs: [
-      { internalType: "address[]", name: "array", type: "address[]" },
-      { internalType: "address", name: "next", type: "address" }
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-] as const;
-
-const SENTINEL_ADDRESS = "0x0000000000000000000000000000000000000001";
-const SMART_SESSIONS_VALIDATOR_ADDRESS = "0x00000000008bdaba73cd9815d79069c247eb4bda";
-
-// --- DEBUG HELPER ---
-const debugLog = (label: string, data?: any) => {
-  if (data === undefined) {
-    console.log(`%c[DEBUG] ${label}`, "color: #00bcd4; font-weight: bold;");
-  } else {
-    console.log(
-      `%c[DEBUG] ${label}:`, "color: #00bcd4; font-weight: bold;",
-      JSON.stringify(data, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2)
-    );
-  }
-};
-
-// Helper to handle BigInt serialization for LocalStorage
-const serializeSession = (key: Hex, session: any) => {
-  const data = JSON.stringify({ key, session }, (_, v) =>
-    typeof v === 'bigint' ? v.toString() : v
-  );
-  debugLog("Serialized Session Data for Storage", data);
-  return data;
-};
-
-const getPasskeyCoords = (publicKey: Hex) => {
-  debugLog("Parsing Passkey Public Key", publicKey);
-  const bytes = hexToBytes(publicKey); // Uint8Array
-  const x = bytesToBigInt(bytes.slice(0, 32));
-  const y = bytesToBigInt(bytes.slice(32, 64));
-  debugLog("Passkey Coords", { x, y });
-  return { x, y };
-};
+// --- CONSTANTS ---
+const SAFES_STORAGE_KEY = "demo_app_safes";
+const USER_1 = "User 1";
+const USER_2 = "User 2";
 
 function App() {
+  // Auth State
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [signer, setSigner] = useState<WebAuthnSigner | null>(null);
-  const [rhinestoneAccount, setRhinestoneAccount] = useState<RhinestoneAccount | null>(null);
-  const [accountAddress, setAccountAddress] = useState<Address | null>(null);
+
+  // Safe Management State
+  const [storedSafes, setStoredSafes] = useState<StoredSafe[]>([]);
+  const [activeSafe, setActiveSafe] = useState<RhinestoneAccount | null>(null);
+  const [activeSafeAddress, setActiveSafeAddress] = useState<Address | null>(null);
+  const [isCreatingSafe, setIsCreatingSafe] = useState(false);
+
+  // Dashboard State
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
-  const [moduleStatus, setModuleStatus] = useState<{ hasValidator: boolean; hasExecutor: boolean } | null>(null);
-  const [hasStoredSession, setHasStoredSession] = useState(false);
-  const [pendingProposal, setPendingProposal] = useState<TxProposal | null>(null);
+  const [balance, setBalance] = useState<string>("0");
 
+  const addLog = (msg: string) => setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
 
-  const addLog = (msg: string) => setLogs((prev) => [...prev, msg]);
-
-  // Check for stored session on load
+  // Load Safes from Storage on Mount
   useEffect(() => {
-    const stored = localStorage.getItem("demo_session_data");
-    if (stored) {
-      debugLog("Found existing session in localStorage", stored);
-      setHasStoredSession(true);
+    const saved = localStorage.getItem(SAFES_STORAGE_KEY);
+    if (saved) {
+      setStoredSafes(JSON.parse(saved));
     }
   }, []);
 
-  // --- NEW HELPER: Fetch Balance ---
-  const logCurrentBalance = async (label: string = "Current Balance") => {
-    if (!accountAddress) return 0n;
-    try {
-      const balance = await publicClient.getBalance({ address: accountAddress });
-      const formatted = formatEther(balance);
-      addLog(`💰 ${label}: ${formatted} ETH`);
-      debugLog(`Balance [${label}]`, { raw: balance, formatted });
-      return balance;
-    } catch (e) {
-      addLog(`Failed to fetch balance: ${e}`);
-      return 0n;
-    }
-  };
+  // --- 1. AUTHENTICATION ---
 
-  // 1. Authentication & Account Setup
-  const handleAuth = async (mode: "register" | "login") => {
+  const handleAuth = async (username: string) => {
     try {
       setLoading(true);
-      debugLog(`--- AUTH STARTED (${mode}) ---`);
+      const isRegistered = WebAuthnSigner.isRegistered(username);
 
-      const uniqueUsername = `demo-user-${Date.now()}`;
-      debugLog("Username", uniqueUsername);
+      let webAuthnSigner: WebAuthnSigner;
 
-      const webAuthnSigner = mode === "register"
-        ? await WebAuthnSigner.create(uniqueUsername)
-        : await WebAuthnSigner.login();
+      if (isRegistered) {
+        addLog(`Logging in as ${username}...`);
+        webAuthnSigner = await WebAuthnSigner.login(username);
+      } else {
+        addLog(`Registering new passkey for ${username}...`);
+        webAuthnSigner = await WebAuthnSigner.register(username);
+      }
 
       setSigner(webAuthnSigner);
-      debugLog("WebAuthn Signer Ready", {
-        credentialId: webAuthnSigner.credentialId,
-        publicKey: webAuthnSigner.publicKey
-      });
+      setCurrentUser(username);
+      addLog(`Authenticated as ${username}`);
 
-      addLog(`Passkey authenticated. Credential ID: ${webAuthnSigner.credentialId.slice(0, 10)}...`);
+      // Reset active safe on user switch
+      setActiveSafe(null);
+      setActiveSafeAddress(null);
 
-      addLog("Initializing Rhinestone SDK and Safe Account...");
+    } catch (e: any) {
+      addLog(`Auth Error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-      const accountConfig = {
+  const logout = () => {
+    setSigner(null);
+    setCurrentUser(null);
+    setActiveSafe(null);
+    setLogs([]);
+  };
+
+  // --- 2. SAFE CREATION & SELECTION ---
+
+  const createNewSafe = async (addCoOwner: boolean) => {
+    if (!signer || !currentUser) return;
+    setLoading(true);
+    setIsCreatingSafe(true);
+
+    try {
+      // 1. Generate a random 32-byte salt (Hex)
+      const saltHex = toHex(crypto.getRandomValues(new Uint8Array(32)));
+      // 2. Convert to BigInt for the Safe 'nonce' parameter
+      const nonceBigInt = hexToBigInt(saltHex);
+
+      const safeName = `Safe #${storedSafes.length + 1} (${currentUser}'s)`;
+
+      addLog(`Initializing new Safe: ${safeName}`);
+
+      const owners: any[] = [signer];
+      const ownerNames = [currentUser];
+
+      // Handle Co-Owner (User 2)
+      if (addCoOwner) {
+        const user2Cred = WebAuthnSigner.getCredential(USER_2);
+        if (!user2Cred) {
+          throw new Error("User 2 is not registered yet. Cannot add as co-owner.");
+        }
+        // Reconstruct User 2's account object from stored credential
+        const user2Account = toWebAuthnAccount({ credential: user2Cred });
+        owners.push(user2Account);
+        ownerNames.push(USER_2);
+        addLog("Added User 2 as initial co-owner.");
+      }
+
+      // Initialize Rhinestone Account
+      const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
         account: {
-          type: 'safe' as const,
+          type: 'safe',
+          nonce: nonceBigInt // Safe uses 'nonce' (BigInt) inside the account object
         },
         owners: {
-          type: 'passkey' as const,
-          accounts: [webAuthnSigner],
+          type: 'passkey',
+          accounts: owners
         },
-        sessions: [],
-      };
+      });
 
-      debugLog("createRhinestoneAccount Config", accountConfig);
-
-      const account = await createRhinestoneAccount(accountConfig);
-
-      debugLog("Rhinestone Account Object Created", account);
-
-      setRhinestoneAccount(account);
       const address = account.getAddress();
-      setAccountAddress(address);
 
-      debugLog("Calculated Smart Account Address", address);
-      addLog(`Safe Account Address: ${address}`);
-
-      // Log initial balance upon connection
-      const balance = await publicClient.getBalance({ address });
-      addLog(`Initial Balance: ${formatEther(balance)} ETH`);
-
-      addLog("Rhinestone Account Client Ready (Sponsored).");
-
-    } catch (e: any) {
-      addLog(`Error: ${e.message}`);
-      console.error("Full error object:", e);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // 2. Deploy account
-  const sendFirstTx = async () => {
-    if (!rhinestoneAccount || !accountAddress) return;
-    setLoading(true);
-    debugLog("--- DEPLOY ACCOUNT CLICKED ---");
-
-    try {
-      addLog("Checking if account is deployed...");
-      const code = await publicClient.getBytecode({ address: accountAddress });
-      debugLog("Account Bytecode", code);
-
-      if (!code) {
-        addLog("Account not deployed yet. Deployment will happen with this transaction.");
-      } else {
-        addLog("Account is already deployed.");
-      }
-
-      await logCurrentBalance("Balance before deployment");
-
-      addLog("Sending a simple transaction to trigger deployment...");
-
-      const txPayload = {
-        chain: publicClient.chain,
-        calls: [{
-          to: accountAddress,
-          value: 0n,
-          data: '0x' as Hex,
-        }],
-        sponsored: true,
+      // Store Metadata
+      const newSafeMeta: StoredSafe = {
+        name: safeName,
+        address,
+        salt: saltHex, // Store as Hex to easily save in localStorage
+        owners: ownerNames
       };
-      debugLog("Deploy Transaction Payload", txPayload);
 
-      const result = await rhinestoneAccount.sendTransaction(txPayload);
+      const updatedSafes = [...storedSafes, newSafeMeta];
+      setStoredSafes(updatedSafes);
+      localStorage.setItem(SAFES_STORAGE_KEY, JSON.stringify(updatedSafes));
 
-      debugLog("Deploy Transaction Result (UserOp Hash)", result);
-      addLog(`Transaction sent! Intent ID: ${result.id}`);
-      addLog("Waiting for execution...");
+      addLog(`Safe Created! Address: ${address}`);
 
-      const receipt = await rhinestoneAccount.waitForExecution(result);
-      debugLog("Deploy Execution Receipt", receipt);
+      // Automatically select the new safe
+      setActiveSafe(account);
+      setActiveSafeAddress(address);
 
-      addLog("Transaction confirmed. Account is deployed.");
     } catch (e: any) {
-      console.error("Full error object:", e);
-      addLog(`Error sending transaction: ${e.message}`);
+      console.error(e);
+      addLog(`Creation Error: ${e.message}`);
     } finally {
       setLoading(false);
+      setIsCreatingSafe(false);
     }
   };
 
-  // 3. Create, Store, and Install Session
-  const installScheduledTransfer = async () => {
-    if (!rhinestoneAccount || !accountAddress) return;
+  const selectSafe = async (safeMeta: StoredSafe) => {
+    if (!signer || !currentUser) return;
     setLoading(true);
-    debugLog("--- INSTALL SESSION CLICKED ---");
+    addLog(`Loading Safe: ${safeMeta.name}...`);
 
     try {
-      // 1) Check balance (same as before)
-      const transferAmount = parseEther("0.00001");
-      const currentBalance = await logCurrentBalance("Check Balance for Session");
+      // 1. Reconstruct the full list of owners to ensure the InitCode (and Address) matches
+      const allOwners = safeMeta.owners.map((username) => {
+        const cred = WebAuthnSigner.getCredential(username);
+        if (!cred) throw new Error(`Credential for ${username} missing from localStorage`);
+        return toWebAuthnAccount({ credential: cred });
+      });
 
-      if (currentBalance < transferAmount) {
-        addLog(
-          "⚠️ WARNING: Account balance is lower than the intended transfer amount. Please fund your Smart Account address displayed above."
-        );
-      }
+      // 2. Convert stored Hex salt back to BigInt
+      const nonceBigInt = hexToBigInt(safeMeta.salt);
 
-      // 2) Build session in memory (DO NOT store it yet)
-      addLog("Generating new session key...");
-
-      const sessionPrivateKey = generatePrivateKey();
-      debugLog("🔑 GENERATED SESSION PRIVATE KEY (Ephemeral)", sessionPrivateKey);
-
-      const sessionKeyAccount = privateKeyToAccount(sessionPrivateKey);
-      debugLog("Session Account Address", sessionKeyAccount.address);
-
-      const targetAddress =
-        "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"; // vitalik.eth
-
-      addLog(
-        `Session Scope: Allow transfer of ${formatEther(
-          transferAmount
-        )} ETH to ${targetAddress.slice(0, 6)}...`
-      );
-      addLog(`Ephemeral Session Key: ${sessionKeyAccount.address}`);
-
-      const session: Session = {
+      const account = await createRhinestoneAccount({
+        ...rhinestoneConfig,
+        account: {
+          type: 'safe',
+          nonce: nonceBigInt
+        },
         owners: {
-          type: "ecdsa",
-          accounts: [sessionKeyAccount],
+          type: 'passkey',
+          accounts: allOwners // Pass ALL original owners, not just the current signer
         },
-        chain: publicClient.chain,
-        policies: [{ type: "sudo" }],
-        actions: [
-          {
-            target: targetAddress,
-            // Native transfer selector for Smart Sessions
-            selector: "0x00000000",
-            policies: [
-              { type: "value-limit", limit: transferAmount },
-              { type: "usage-limit", limit: 1n }, // One time use
-            ],
-          },
-        ],
-      };
+      });
 
-      debugLog("Constructed Session Object", session);
+      const address = account.getAddress();
 
-      // 3) Check if Smart Sessions validator is already installed
-      addLog("Checking if Smart Sessions validator is already installed...");
-      let validators: Address[] = [];
-
-      try {
-        const [modules] = await publicClient.readContract({
-          address: accountAddress,
-          abi: MODULE_ABI,
-          functionName: "getValidatorsPaginated",
-          // Sentinel pattern used by Nexus
-          args: [SENTINEL_ADDRESS as Address, 10n],
-        });
-
-        validators = modules as Address[];
-        debugLog("Fetched On-Chain Validators", validators);
-      } catch (err) {
-        debugLog("Error reading validators (expected if undeployed)", err);
-        addLog(
-          "Could not read validators (account may be freshly deployed). Assuming no Smart Sessions validator installed."
-        );
-      }
-
-      const hasSmartSessionsValidator = validators.some(
-        (v) => v.toLowerCase() === SMART_SESSIONS_VALIDATOR_ADDRESS.toLowerCase()
-      );
-
-      const calls: any[] = [];
-
-      if (!hasSmartSessionsValidator) {
-        addLog(
-          "Smart Sessions validator not found. Installing it on the account..."
-        );
-        const installCall = installModule({
-          type: "validator",
-          address: SMART_SESSIONS_VALIDATOR_ADDRESS,
-          initData: "0x", // No init data required
-        });
-        debugLog("Adding installModule Call", installCall);
-        calls.push(installCall);
+      if (address !== safeMeta.address) {
+        addLog(`⚠️ CRITICAL: Address mismatch! Expected ${safeMeta.address}, got ${address}`);
       } else {
-        addLog(
-          "Smart Sessions validator already installed. Skipping installation."
-        );
+        addLog("Safe loaded successfully.");
       }
 
-      addLog("Enabling session on-chain...");
-      const enableSessionCall = enableSession(session);
-      debugLog("Adding enableSession Call", enableSessionCall);
-      calls.push(enableSessionCall);
+      setActiveSafe(account);
+      setActiveSafeAddress(address);
+      fetchBalance(address);
 
-      addLog(
-        "Sending transaction to install (if needed) and enable the session..."
-      );
-
-      const txPayload = {
-        chain: publicClient.chain,
-        calls,
-        sponsored: true,
-      };
-      debugLog("Session Installation TX Payload", txPayload);
-
-      const result = await rhinestoneAccount.sendTransaction(txPayload);
-
-      debugLog("Session Installation Result (UserOp Hash)", result);
-      addLog(`Installation / enableSession intent sent! ID: ${result.id}`);
-
-      const receipt = await rhinestoneAccount.waitForExecution(result);
-      debugLog("Session Installation Receipt", receipt);
-
-      addLog(
-        "✅ Session Installed / Enabled. You can now execute the transfer without the Passkey."
-      );
-
-      // 4) Only save to localStorage AFTER on-chain success
-      addLog("Saving session credentials to local storage...");
-      const sessionForStorage = {
-        ...session,
-        owners: { type: "ecdsa", accounts: [] }, // strip accounts before storing
-      };
-
-      debugLog("Session Object stripped for storage", sessionForStorage);
-
-      localStorage.setItem(
-        "demo_session_data",
-        serializeSession(sessionPrivateKey as Hex, sessionForStorage)
-      );
-      setHasStoredSession(true);
     } catch (e: any) {
-      console.error("Full error object:", e);
-      addLog(`Error installing session: ${e.message}`);
-
-      // Make sure we don’t keep a stale session flag around
-      localStorage.removeItem("demo_session_data");
-      setHasStoredSession(false);
+      console.error(e);
+      addLog(`Selection Error: ${e.message}`);
     } finally {
       setLoading(false);
     }
   };
 
-  const addExtraPasskeyOwner = async () => {
-    if (!rhinestoneAccount) return;
-    setLoading(true);
-
+  const fetchBalance = async (addr: Address) => {
     try {
-      addLog("Creating a new passkey for an extra owner...");
-
-      // Create a *new* passkey credential (on this or another device)
-      const newSigner = await WebAuthnSigner.create(
-        `demo-coowner-${Date.now()}`
-      );
-
-      addLog(
-        `New passkey co-owner registered. Credential ID: ${newSigner.credentialId.slice(
-          0,
-          10
-        )}...`
-      );
-
-      // Convert the passkey's public key into (x, y) coords
-      const { x: pubKeyX, y: pubKeyY } = getPasskeyCoords(
-        newSigner.publicKey as Hex
-      );
-
-      const requiresUV = false; // or true if you want to enforce user verification
-
-      addLog("Sending tx to add passkey co-owner to the multisig...");
-
-      // On-chain: add this passkey as an owner in the WebAuthn validator
-      const tx = await rhinestoneAccount.sendTransaction({
-        chain: publicClient.chain,
-        calls: [addPasskeyOwner(pubKeyX, pubKeyY, requiresUV)],
-        sponsored: true,
-      });
-
-      addLog(`addOwner intent sent! ID: ${tx.id}`);
-      await rhinestoneAccount.waitForExecution(tx);
-
-      addLog("✅ Extra passkey owner added to the account (multisig-ready).");
-
-    } catch (e: any) {
-      console.error("Full error object (addExtraPasskeyOwner):", e);
-      addLog(`Error adding passkey owner: ${e.message}`);
-    } finally {
-      setLoading(false);
+      const bal = await publicClient.getBalance({ address: addr });
+      setBalance(formatEther(bal));
+    } catch (e) {
+      console.error(e);
     }
   };
 
-  // 4. Execute using the Stored Session (No Passkey needed)
-  const executeScheduledTransfer = async () => {
-    if (!rhinestoneAccount) return;
-    setLoading(true);
-    debugLog("--- EXECUTE SESSION CLICKED ---");
+  // --- 3. SAFE ACTIONS ---
 
-    try {
-      addLog("Retrieving session from storage...");
-      const storedData = localStorage.getItem("demo_session_data");
-      debugLog("Raw Stored Data", storedData);
-
-      if (!storedData) throw new Error("No session found in storage");
-
-      const { key, session: sessionConfig } = JSON.parse(storedData);
-      debugLog("Parsed Storage Data (Key)", key);
-      debugLog("Parsed Storage Data (Config)", sessionConfig);
-
-      const sessionOwner = privateKeyToAccount(key);
-      debugLog("Restored Session Account Address", sessionOwner.address);
-
-      // Rebuild the Session with proper BigInts & owner
-      const parsedActions =
-        (sessionConfig.actions ?? []).map((a: any) => ({
-          ...a,
-          policies: a.policies.map((p: any) => ({
-            ...p,
-            limit: p.limit ? BigInt(p.limit) : undefined,
-          })),
-        }));
-
-      const session: Session = {
-        ...sessionConfig,
-        chain: publicClient.chain,
-        owners: {
-          type: "ecdsa",
-          accounts: [sessionOwner],
-        },
-        actions: parsedActions,
-      };
-
-      debugLog("Fully Reconstructed Session Object", session);
-
-      // Take target + amount from the session itself (so it ALWAYS matches)
-      if (!session.actions || session.actions.length === 0) {
-        throw new Error("Session has no actions configured");
-      }
-
-      // Take target + amount from the first action
-      const action = session.actions[0] as any;
-      const targetAddress = action.target as Address;
-      const transferAmount =
-        (action.policies.find((p: any) => p.type === "value-limit")?.limit as bigint) ??
-        parseEther("0.00001");
-
-      debugLog("Extracted Action Details", { targetAddress, transferAmount });
-
-      await logCurrentBalance("Balance BEFORE Transfer");
-
-      addLog("Executing transfer using Session Key...");
-
-      const userOpPayload = {
-        chain: publicClient.chain,
-        calls: [
-          {
-            to: targetAddress,
-            value: transferAmount,
-            // 🔑 IMPORTANT: use the same selector allowed in the session
-            data: action.selector,
-          },
-        ],
-        signers: {
-          type: "session" as const,
-          session,
-        },
-      };
-
-      debugLog("sendUserOperation Payload", userOpPayload);
-
-      const result = await rhinestoneAccount.sendUserOperation(userOpPayload);
-
-      debugLog("Execution Result (UserOp Hash)", result);
-      addLog(`Execution sent via Session! UserOp Hash: ${result.hash}`);
-
-      const receipt = await rhinestoneAccount.waitForExecution(result);
-      debugLog("Execution Receipt", receipt);
-
-      addLog("✅ Transfer Successful! Verified via Smart Session.");
-
-      await logCurrentBalance("Balance AFTER Transfer");
-
-      localStorage.removeItem("demo_session_data");
-      setHasStoredSession(false);
-    } catch (e: any) {
-      console.error("Full error object:", e);
-      addLog(`Execution failed: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const setThresholdToTwo = async () => {
-    if (!rhinestoneAccount) return;
-    setLoading(true);
-
-    try {
-      addLog("Updating passkey multisig threshold to 2-of-N...");
-
-      const tx = await rhinestoneAccount.sendTransaction({
-        chain: publicClient.chain,
-        calls: [changeThreshold(2)], // 2-of-N
-        sponsored: true,
-      });
-
-      addLog(`changeThreshold intent sent! ID: ${tx.id}`);
-      await rhinestoneAccount.waitForExecution(tx);
-
-      addLog("✅ Threshold updated to 2-of-N. You now need 2 valid passkey signatures per tx.");
-    } catch (e: any) {
-      console.error("setThresholdToTwo error:", e);
-      addLog(`Error changing threshold: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const refreshOwners = async () => {
-    if (!rhinestoneAccount) return;
-
-    try {
-      const owners = await rhinestoneAccount.getOwners(publicClient.chain);
-      addLog(
-        `Owners: ${owners?.accounts.length} | threshold: ${owners?.threshold.toString()}`
-      );
-    } catch (e: any) {
-      console.error("refreshOwners error:", e);
-      addLog(`Error fetching owners: ${e.message}`);
-    }
-  };
-
-  const proposeTransfer = async () => {
-    if (!accountAddress) {
-      addLog("Cannot propose tx: account address missing.");
-      return;
-    }
-
-    const transferAmount = parseEther("0.00002");
-    const target = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" as Address; // vitalik.eth
-
-    const proposal: TxProposal = {
-      id: `proposal-${Date.now()}`,
-      description: `Send ${formatEther(transferAmount)} ETH to ${target.slice(0, 6)}...`,
-      calls: [
-        {
-          to: target,
-          value: transferAmount,
-          data: "0x" as Hex,
-        },
-      ],
-    };
-
-    setPendingProposal(proposal);
-    addLog(`📄 Proposal created: ${proposal.id} — ${proposal.description}`);
-
-    // In a real app, you'd also sync this proposal to a backend / DB
-    // so User 2 can see it from a different device.
-  };
-
-  const approveAndExecuteProposal = async () => {
-    if (!rhinestoneAccount) {
-      addLog("No Rhinestone account available.");
-      return;
-    }
-    if (!pendingProposal) {
-      addLog("No pending proposal to execute.");
-      return;
-    }
-    if (!signer) {
-      addLog("No active passkey signer.");
-      return;
-    }
-
+  const deploySafe = async () => {
+    if (!activeSafe || !activeSafeAddress || !signer) return; // Ensure signer exists
     setLoading(true);
     try {
-      await logCurrentBalance("Balance BEFORE proposed tx");
-
-      addLog(
-        `User approving proposal ${pendingProposal.id} — ${pendingProposal.description}`
-      );
-
-      const result = await rhinestoneAccount.sendTransaction({
-        chain: publicClient.chain,
-        calls: pendingProposal.calls,
-        // For passkeys multisig the SDK will route to the WebAuthn validator.
-        // For threshold=1, this single signer is enough.
-        sponsored: true,
-      });
-
-      addLog(`Multisig tx sent! Intent ID: ${result.id}`);
-      await rhinestoneAccount.waitForExecution(result);
-      addLog("✅ Proposed transaction executed.");
-
-      await logCurrentBalance("Balance AFTER proposed tx");
-
-      setPendingProposal(null);
-    } catch (e: any) {
-      console.error("approveAndExecuteProposal error:", e);
-      addLog(`Error executing proposal: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const checkModules = async () => {
-    if (!accountAddress) return;
-    setLoading(true);
-    debugLog("--- VERIFY MODULES CLICKED ---");
-
-    try {
-      addLog("Reading installed validators...");
-      const code = await publicClient.getBytecode({ address: accountAddress });
-      debugLog("Account Bytecode", code);
-
-      if (!code) {
-        addLog("Account not deployed yet.");
+      addLog("Checking deployment status...");
+      const code = await publicClient.getBytecode({ address: activeSafeAddress });
+      if (code) {
+        addLog("Safe is already deployed.");
+        setLoading(false);
         return;
       }
 
-      const [modules] = await publicClient.readContract({
-        address: accountAddress,
-        abi: MODULE_ABI,
-        functionName: "getValidatorsPaginated",
-        args: [SENTINEL_ADDRESS as Address, 10n],
+      addLog("Deploying Safe...");
+
+      const tx = await activeSafe.sendTransaction({
+        chain: publicClient.chain,
+        calls: [{ to: activeSafeAddress, value: 0n, data: "0x" }],
+        sponsored: true,
+        // 🔑 FIX: Explicitly tell the SDK to ONLY use the current user's passkey
+        signers: {
+          type: 'owner',
+          kind: 'passkey',
+          accounts: [signer]
+        }
       });
 
-      debugLog("Raw Modules Response", modules);
-
-      const validators = modules as Address[];
-      const hasSmartSessionsValidator = validators.some(
-        (m) => m.toLowerCase() === SMART_SESSIONS_VALIDATOR_ADDRESS.toLowerCase()
-      );
-
-      debugLog("Parsed Validators List", validators);
-      debugLog("Smart Session Validator Detected?", hasSmartSessionsValidator);
-
-      setModuleStatus({
-        hasValidator: hasSmartSessionsValidator,
-        hasExecutor: hasSmartSessionsValidator,
-      });
-
-      if (validators.length === 0) {
-        addLog("No validators installed.");
-      } else {
-        addLog(`Found validators: ${validators.join(", ")}`);
-      }
+      addLog(`Deploy Intent: ${tx.id}`);
+      await activeSafe.waitForExecution(tx);
+      addLog("✅ Safe Deployed successfully.");
     } catch (e: any) {
-      debugLog("Error checking modules", e);
-      addLog(`Error checking modules: ${e.message}`);
+      console.error(e);
+      addLog(`Deploy Error: ${e.message}`);
     } finally {
       setLoading(false);
     }
   };
 
+  // --- RENDER HELPERS ---
+
+  if (!currentUser) {
+    return (
+      <div className="app-container">
+        <header><h1>Safe Multi-User Demo</h1></header>
+        <div className="auth-card dashboard-card">
+          <h3>Select User</h3>
+          <p className="subtitle">Choose a persona to test with. Data is stored in localStorage.</p>
+          <div className="action-grid">
+            <button
+              className="primary"
+              onClick={() => handleAuth(USER_1)}
+              disabled={loading}
+            >
+              {WebAuthnSigner.isRegistered(USER_1) ? `Login as ${USER_1}` : `Register ${USER_1}`}
+            </button>
+            <button
+              className="primary"
+              onClick={() => handleAuth(USER_2)}
+              disabled={loading}
+            >
+              {WebAuthnSigner.isRegistered(USER_2) ? `Login as ${USER_2}` : `Register ${USER_2}`}
+            </button>
+          </div>
+        </div>
+        <div className="console-container">
+          {logs.map((l, i) => <div key={i} className="log-entry">{l}</div>)}
+        </div>
+      </div>
+    );
+  }
+
+  // Logged In View
   return (
     <div className="app-container">
       <header>
-        <h1>Safe + Passkeys + Sessions</h1>
-        <div className="subtitle">Gasless Modular Smart Account Demo</div>
+        <h1>Safe Multi-User Demo</h1>
+        <div className="auth-section">
+          <div className="logged-in-badge">👤 {currentUser}</div>
+          <button onClick={logout} className="small">Logout</button>
+        </div>
       </header>
 
-      <div className="auth-section">
-        {!signer ? (
-          <>
-            <button className="primary" onClick={() => handleAuth("register")} disabled={loading}>
-              Register New Passkey
-            </button>
-            <button onClick={() => handleAuth("login")} disabled={loading}>
-              Login Existing
-            </button>
-          </>
-        ) : (
-          <div className="logged-in-badge">
-            <span>●</span> Passkey Active
-          </div>
-        )}
-      </div>
-
-      {signer && (
+      {/* SAFE LIST / CREATION */}
+      {!activeSafe && (
         <div className="dashboard-card">
-          <h3>Account Actions</h3>
+          <h3>My Safes</h3>
 
-          <div className="address-container">
-            <span className="label">Safe Address:</span>
-            <code className="address-text">{accountAddress || "Calculating..."}</code>
-          </div>
+          {storedSafes.length > 0 ? (
+            <div className="safe-list">
+              {storedSafes.map((safe, idx) => (
+                <div key={idx} className="status-item safe-item" onClick={() => selectSafe(safe)}>
+                  <div>
+                    <div className="safe-name">{safe.name}</div>
+                    <div className="safe-addr">{safe.address.slice(0, 8)}...{safe.address.slice(-6)}</div>
+                  </div>
+                  <button disabled={loading}>Select</button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="subtitle">No Safes found locally.</p>
+          )}
 
-          <div className="action-grid">
-            <button className="primary" onClick={sendFirstTx} disabled={loading || !rhinestoneAccount}>
-              1. Deploy Account
-            </button>
+          <hr style={{ borderColor: 'var(--border-color)', margin: '1.5rem 0' }} />
 
-            <button onClick={installScheduledTransfer} disabled={loading || !rhinestoneAccount || hasStoredSession}>
-              2. Create & Store Session
-            </button>
+          <h3>Create New Safe</h3>
+          <div className="create-section">
+            <div style={{ marginBottom: '1rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  id="addCoOwner"
+                  disabled={currentUser === USER_2 || !WebAuthnSigner.isRegistered(USER_2)}
+                />
+                <span>Add {USER_2} as signer immediately?</span>
+              </label>
+              {currentUser !== USER_2 && !WebAuthnSigner.isRegistered(USER_2) && (
+                <small style={{ color: 'var(--text-secondary)', marginLeft: '1.5rem' }}>
+                  (Register User 2 first to enable this)
+                </small>
+              )}
+            </div>
 
             <button
-              className={hasStoredSession ? "primary" : ""}
-              onClick={executeScheduledTransfer}
-              disabled={loading || !rhinestoneAccount || !hasStoredSession}
+              className="primary"
+              onClick={() => {
+                const cb = document.getElementById('addCoOwner') as HTMLInputElement;
+                createNewSafe(cb?.checked || false);
+              }}
+              disabled={loading || isCreatingSafe}
             >
-              3. Execute with Session
-            </button>
-
-            <button onClick={checkModules} disabled={loading || !rhinestoneAccount}>
-              Verify Modules
-            </button>
-
-            <button onClick={addExtraPasskeyOwner} disabled={loading || !rhinestoneAccount}>
-              Add Extra Passkey Owner (Multisig)
-            </button>
-
-            {/* NEW: Multisig config */}
-            <button onClick={setThresholdToTwo} disabled={loading || !rhinestoneAccount}>
-              Set Threshold to 2-of-N
-            </button>
-            <button onClick={refreshOwners} disabled={loading || !rhinestoneAccount}>
-              Refresh Owners / Threshold
-            </button>
-
-            {/* NEW: Proposal / approval */}
-            <button onClick={proposeTransfer} disabled={loading || !rhinestoneAccount}>
-              Propose Transfer (User 1)
-            </button>
-            <button
-              onClick={approveAndExecuteProposal}
-              disabled={loading || !rhinestoneAccount || !pendingProposal}
-            >
-              Approve & Execute Proposal (User 2)
+              {isCreatingSafe ? "Creating..." : "+ Create New Safe"}
             </button>
           </div>
         </div>
       )}
 
-      {moduleStatus && (
+      {/* ACTIVE SAFE DASHBOARD */}
+      {activeSafe && activeSafeAddress && (
         <div className="dashboard-card">
-          <h4>On-Chain Status</h4>
-          <div className="status-grid">
-            <div className="status-item">
-              <span>Validators Installed</span>
-              <span className={`status-value ${moduleStatus.hasValidator ? "status-success" : "status-error"}`}>
-                {moduleStatus.hasValidator ? "YES" : "NO"}
-              </span>
-            </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h3>Active Safe</h3>
+            <button onClick={() => { setActiveSafe(null); setActiveSafeAddress(null); }}>Back to List</button>
+          </div>
+
+          <div className="address-container">
+            <span className="label">Address:</span>
+            <code className="address-text">{activeSafeAddress}</code>
+          </div>
+          <div className="status-item">
+            <span>Balance:</span>
+            <span className="status-value">{balance} ETH</span>
+          </div>
+
+          <div className="action-grid" style={{ marginTop: '1.5rem' }}>
+            <button className="primary" onClick={deploySafe} disabled={loading}>
+              Deploy Safe
+            </button>
+            <button onClick={() => fetchBalance(activeSafeAddress)} disabled={loading}>
+              Refresh Balance
+            </button>
           </div>
         </div>
       )}
 
       <div className="console-container">
-        {logs.length === 0 && <div className="log-entry">System ready. Waiting for actions...</div>}
         {logs.map((l, i) => <div key={i} className="log-entry">{l}</div>)}
       </div>
     </div>
