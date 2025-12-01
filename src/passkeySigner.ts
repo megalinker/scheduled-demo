@@ -1,10 +1,15 @@
-import { createWebAuthnCredential, toWebAuthnAccount } from 'viem/account-abstraction';
+import { createWebAuthnCredential, toWebAuthnAccount, type WebAuthnAccount as ViemWebAuthnAccount } from 'viem/account-abstraction';
+import type { Hash } from 'viem';
 
 const USERS_STORAGE_KEY = "demo_app_users";
 
-export type WebAuthnSigner = ReturnType<typeof toWebAuthnAccount> & {
+type ExtendedWebAuthnSigner = Omit<ViemWebAuthnAccount, 'sign'> & {
+    sign: (args: { hash: Hash; clientDataJSON?: string }) => ReturnType<ViemWebAuthnAccount['sign']>;
     credentialId: string;
 };
+
+// Use our new, more accurate type.
+export type WebAuthnSigner = ExtendedWebAuthnSigner;
 
 export const WebAuthnSigner = {
     // Check if a user is already registered
