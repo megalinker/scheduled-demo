@@ -1,10 +1,13 @@
+//--- File: src/App.tsx ---
+
 import { useState, useEffect } from "react";
 import {
   type Address,
   formatEther,
   type Hex,
   toHex,
-  hexToBigInt
+  hexToBigInt,
+  concat
 } from "viem";
 import { toWebAuthnAccount } from "viem/account-abstraction";
 import { publicClient, rhinestoneConfig } from "./clients";
@@ -13,17 +16,49 @@ import "./App.css";
 import { createRhinestoneAccount, type RhinestoneAccount } from "@rhinestone/sdk";
 
 // --- TYPES ---
+
 type StoredSafe = {
   name: string;
   address: Address;
-  salt: Hex; // Storing as Hex is fine, we convert to BigInt for usage
-  owners: string[]; // list of usernames
+  salt: Hex;
+  owners: string[];
+  threshold: number;
+};
+
+type ProposalSignature = {
+  signerName: string;
+  signature: Hex;
+};
+
+type PendingProposal = {
+  id: string;
+  safeAddress: Address;
+  description: string;
+  calls: { to: Address; value: bigint; data: Hex }[];
+  signatures: ProposalSignature[];
+  nonce: string;
+  preparedUserOp: any; // Stored PreparedUserOperationData
 };
 
 // --- CONSTANTS ---
 const SAFES_STORAGE_KEY = "demo_app_safes";
+const PROPOSALS_STORAGE_KEY = "demo_app_proposals";
 const USER_1 = "User 1";
 const USER_2 = "User 2";
+
+// --- HELPERS ---
+
+const restoreUserOpBigInts = (op: any) => {
+  if (!op) return op;
+  const bigIntFields = ['nonce', 'callGasLimit', 'verificationGasLimit', 'preVerificationGas', 'maxFeePerGas', 'maxPriorityFeePerGas', 'value'];
+  const newOp = { ...op };
+  bigIntFields.forEach(field => {
+    if (newOp[field] && typeof newOp[field] === 'string') {
+      newOp[field] = hexToBigInt(newOp[field] as Hex);
+    }
+  });
+  return newOp;
+};
 
 function App() {
   // Auth State
@@ -34,7 +69,13 @@ function App() {
   const [storedSafes, setStoredSafes] = useState<StoredSafe[]>([]);
   const [activeSafe, setActiveSafe] = useState<RhinestoneAccount | null>(null);
   const [activeSafeAddress, setActiveSafeAddress] = useState<Address | null>(null);
-  const [isCreatingSafe, setIsCreatingSafe] = useState(false);
+  const [activeSafeThreshold, setActiveSafeThreshold] = useState<number>(1);
+
+  // Creation Form State
+  const [creationThreshold, setCreationThreshold] = useState(1);
+
+  // Proposals State
+  const [proposals, setProposals] = useState<PendingProposal[]>([]);
 
   // Dashboard State
   const [logs, setLogs] = useState<string[]>([]);
@@ -43,13 +84,34 @@ function App() {
 
   const addLog = (msg: string) => setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
 
-  // Load Safes from Storage on Mount
+  // --- INITIALIZATION ---
+
   useEffect(() => {
-    const saved = localStorage.getItem(SAFES_STORAGE_KEY);
-    if (saved) {
-      setStoredSafes(JSON.parse(saved));
+    const savedSafes = localStorage.getItem(SAFES_STORAGE_KEY);
+    if (savedSafes) setStoredSafes(JSON.parse(savedSafes));
+
+    const savedProposals = localStorage.getItem(PROPOSALS_STORAGE_KEY);
+    if (savedProposals) {
+      const parsed = JSON.parse(savedProposals);
+
+      // Fix BigInts in the preparedUserOp.userOperation object
+      const restored = parsed.map((p: PendingProposal) => ({
+        ...p,
+        preparedUserOp: {
+          ...p.preparedUserOp,
+          userOperation: restoreUserOpBigInts(p.preparedUserOp.userOperation)
+        }
+      }));
+      setProposals(restored);
     }
   }, []);
+
+  // Save proposals whenever they change
+  useEffect(() => {
+    const serialized = JSON.stringify(proposals, (_, v) => typeof v === 'bigint' ? toHex(v) : v);
+    localStorage.setItem(PROPOSALS_STORAGE_KEY, serialized);
+  }, [proposals]);
+
 
   // --- 1. AUTHENTICATION ---
 
@@ -59,12 +121,9 @@ function App() {
       const isRegistered = WebAuthnSigner.isRegistered(username);
 
       let webAuthnSigner: WebAuthnSigner;
-
       if (isRegistered) {
-        addLog(`Logging in as ${username}...`);
         webAuthnSigner = await WebAuthnSigner.login(username);
       } else {
-        addLog(`Registering new passkey for ${username}...`);
         webAuthnSigner = await WebAuthnSigner.register(username);
       }
 
@@ -75,7 +134,6 @@ function App() {
       // Reset active safe on user switch
       setActiveSafe(null);
       setActiveSafeAddress(null);
-
     } catch (e: any) {
       addLog(`Auth Error: ${e.message}`);
     } finally {
@@ -95,55 +153,46 @@ function App() {
   const createNewSafe = async (addCoOwner: boolean) => {
     if (!signer || !currentUser) return;
     setLoading(true);
-    setIsCreatingSafe(true);
 
     try {
-      // 1. Generate a random 32-byte salt (Hex)
       const saltHex = toHex(crypto.getRandomValues(new Uint8Array(32)));
-      // 2. Convert to BigInt for the Safe 'nonce' parameter
       const nonceBigInt = hexToBigInt(saltHex);
-
-      const safeName = `Safe #${storedSafes.length + 1} (${currentUser}'s)`;
-
-      addLog(`Initializing new Safe: ${safeName}`);
 
       const owners: any[] = [signer];
       const ownerNames = [currentUser];
 
-      // Handle Co-Owner (User 2)
       if (addCoOwner) {
         const user2Cred = WebAuthnSigner.getCredential(USER_2);
-        if (!user2Cred) {
-          throw new Error("User 2 is not registered yet. Cannot add as co-owner.");
-        }
-        // Reconstruct User 2's account object from stored credential
-        const user2Account = toWebAuthnAccount({ credential: user2Cred });
-        owners.push(user2Account);
+        if (!user2Cred) throw new Error("User 2 not registered locally.");
+        owners.push(toWebAuthnAccount({ credential: user2Cred }));
         ownerNames.push(USER_2);
-        addLog("Added User 2 as initial co-owner.");
       }
 
-      // Initialize Rhinestone Account
+      if (creationThreshold > owners.length) {
+        throw new Error(`Threshold (${creationThreshold}) cannot be greater than owners (${owners.length})`);
+      }
+
+      const safeName = `Safe #${storedSafes.length + 1} (${creationThreshold}/${owners.length})`;
+      addLog(`Creating ${safeName}...`);
+
       const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
-        account: {
-          type: 'safe',
-          nonce: nonceBigInt // Safe uses 'nonce' (BigInt) inside the account object
-        },
+        account: { type: 'safe', nonce: nonceBigInt },
         owners: {
           type: 'passkey',
-          accounts: owners
+          accounts: owners,
+          threshold: creationThreshold
         },
       });
 
       const address = account.getAddress();
 
-      // Store Metadata
       const newSafeMeta: StoredSafe = {
         name: safeName,
         address,
-        salt: saltHex, // Store as Hex to easily save in localStorage
-        owners: ownerNames
+        salt: saltHex,
+        owners: ownerNames,
+        threshold: creationThreshold
       };
 
       const updatedSafes = [...storedSafes, newSafeMeta];
@@ -151,17 +200,13 @@ function App() {
       localStorage.setItem(SAFES_STORAGE_KEY, JSON.stringify(updatedSafes));
 
       addLog(`Safe Created! Address: ${address}`);
-
-      // Automatically select the new safe
-      setActiveSafe(account);
-      setActiveSafeAddress(address);
+      selectSafe(newSafeMeta);
 
     } catch (e: any) {
       console.error(e);
       addLog(`Creation Error: ${e.message}`);
     } finally {
       setLoading(false);
-      setIsCreatingSafe(false);
     }
   };
 
@@ -171,38 +216,30 @@ function App() {
     addLog(`Loading Safe: ${safeMeta.name}...`);
 
     try {
-      // 1. Reconstruct the full list of owners to ensure the InitCode (and Address) matches
       const allOwners = safeMeta.owners.map((username) => {
         const cred = WebAuthnSigner.getCredential(username);
-        if (!cred) throw new Error(`Credential for ${username} missing from localStorage`);
+        if (!cred) throw new Error(`Credential for ${username} missing`);
         return toWebAuthnAccount({ credential: cred });
       });
 
-      // 2. Convert stored Hex salt back to BigInt
-      const nonceBigInt = hexToBigInt(safeMeta.salt);
-
       const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
-        account: {
-          type: 'safe',
-          nonce: nonceBigInt
-        },
+        account: { type: 'safe', nonce: hexToBigInt(safeMeta.salt) },
         owners: {
           type: 'passkey',
-          accounts: allOwners // Pass ALL original owners, not just the current signer
+          accounts: allOwners,
+          threshold: safeMeta.threshold
         },
       });
 
       const address = account.getAddress();
-
       if (address !== safeMeta.address) {
-        addLog(`⚠️ CRITICAL: Address mismatch! Expected ${safeMeta.address}, got ${address}`);
-      } else {
-        addLog("Safe loaded successfully.");
+        addLog(`⚠️ Address Mismatch! Expected ${safeMeta.address}, got ${address}`);
       }
 
       setActiveSafe(account);
       setActiveSafeAddress(address);
+      setActiveSafeThreshold(safeMeta.threshold);
       fetchBalance(address);
 
     } catch (e: any) {
@@ -222,27 +259,20 @@ function App() {
     }
   };
 
-  // --- 3. SAFE ACTIONS ---
+  // --- 3. MULTI-SIG PROPOSAL LOGIC ---
 
-  const deploySafe = async () => {
-    if (!activeSafe || !activeSafeAddress || !signer) return; // Ensure signer exists
+  const createProposal = async () => {
+    if (!activeSafe || !activeSafeAddress || !signer) return;
     setLoading(true);
+
     try {
-      addLog("Checking deployment status...");
-      const code = await publicClient.getBytecode({ address: activeSafeAddress });
-      if (code) {
-        addLog("Safe is already deployed.");
-        setLoading(false);
-        return;
-      }
+      addLog("Preparing deployment proposal...");
 
-      addLog("Deploying Safe...");
-
-      const tx = await activeSafe.sendTransaction({
+      // 1. Prepare the UserOp
+      // 🔑 CRITICAL: Specify 'signers' here so the SDK knows ONLY the current user is signing this step.
+      const preparedOp = await activeSafe.prepareUserOperation({
         chain: publicClient.chain,
-        calls: [{ to: activeSafeAddress, value: 0n, data: "0x" }],
-        sponsored: true,
-        // 🔑 FIX: Explicitly tell the SDK to ONLY use the current user's passkey
+        calls: [{ to: activeSafeAddress, value: 0n, data: "0x" as Hex }],
         signers: {
           type: 'owner',
           kind: 'passkey',
@@ -250,40 +280,149 @@ function App() {
         }
       });
 
-      addLog(`Deploy Intent: ${tx.id}`);
-      await activeSafe.waitForExecution(tx);
-      addLog("✅ Safe Deployed successfully.");
+      // 2. Sign with CURRENT user
+      addLog("Signing with current user...");
+      const signedOp = await activeSafe.signUserOperation(preparedOp);
+
+      // Extract the signature (This is User 1's signature)
+      const user1Signature = signedOp.signature;
+
+      const newProposal: PendingProposal = {
+        id: `proposal-${Date.now()}`,
+        safeAddress: activeSafeAddress,
+        description: "Deploy Safe (Initial Transaction)",
+        calls: [{ to: activeSafeAddress, value: 0n, data: "0x" }],
+        signatures: [{ signerName: currentUser!, signature: user1Signature }],
+        // 🔑 FIX: Access nonce from nested userOperation object
+        nonce: preparedOp.userOperation.nonce.toString(),
+        preparedUserOp: preparedOp
+      };
+
+      setProposals(prev => [...prev, newProposal]);
+      addLog(`📄 Proposal created! ID: ${newProposal.id}`);
+      addLog(`Signatures: 1/${activeSafeThreshold}`);
+
+      if (activeSafeThreshold === 1) {
+        addLog("Threshold is 1. Executing immediately...");
+        await executeProposal(newProposal, [user1Signature]);
+      } else {
+        addLog("Waiting for more signatures...");
+      }
+
     } catch (e: any) {
       console.error(e);
-      addLog(`Deploy Error: ${e.message}`);
+      addLog(`Proposal Error: ${e.message}`);
     } finally {
       setLoading(false);
     }
   };
 
-  // --- RENDER HELPERS ---
+  const signProposal = async (proposal: PendingProposal) => {
+    if (!activeSafe || !signer || !currentUser) return;
+
+    if (proposal.signatures.find(s => s.signerName === currentUser)) {
+      addLog("You have already signed this proposal.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      addLog(`Signing proposal ${proposal.id} as ${currentUser}...`);
+
+      // 🔑 FIX: Clone the stored preparedOp and update the 'signers' in the transaction config
+      // This forces the SDK to use the *current* user's passkey to sign the existing Hash.
+      const opForSigning = {
+        ...proposal.preparedUserOp,
+        transaction: {
+          ...proposal.preparedUserOp.transaction,
+          signers: {
+            type: 'owner',
+            kind: 'passkey',
+            accounts: [signer] // Override with current signer
+          }
+        }
+      };
+
+      const signedOp = await activeSafe.signUserOperation(opForSigning);
+
+      const newSignature = signedOp.signature;
+
+      // Update proposal in state
+      const updatedProposals = proposals.map(p => {
+        if (p.id === proposal.id) {
+          const updatedP = {
+            ...p,
+            signatures: [...p.signatures, { signerName: currentUser!, signature: newSignature }]
+          };
+
+          addLog(`Signed! Total signatures: ${updatedP.signatures.length}/${activeSafeThreshold}`);
+          return updatedP;
+        }
+        return p;
+      });
+
+      setProposals(updatedProposals);
+
+      const currentProposal = updatedProposals.find(p => p.id === proposal.id);
+      if (currentProposal && currentProposal.signatures.length >= activeSafeThreshold) {
+        const allSigs = currentProposal.signatures.map(s => s.signature);
+        await executeProposal(currentProposal, allSigs);
+      }
+
+    } catch (e: any) {
+      console.error(e);
+      addLog(`Signing Error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const executeProposal = async (proposal: PendingProposal, signatures: Hex[]) => {
+    if (!activeSafe) return;
+    setLoading(true);
+    addLog("🚀 Threshold met. Executing transaction on-chain...");
+
+    try {
+      // 1. Concatenate signatures for Safe
+      const combinedSignature = concat(signatures);
+
+      // 2. Construct SignedUserOperationData
+      const signedOpData = {
+        ...proposal.preparedUserOp,
+        signature: combinedSignature
+      };
+
+      // 3. Submit
+      const result = await activeSafe.submitUserOperation(signedOpData);
+
+      addLog(`UserOp Sent! Hash: ${result.hash}`);
+      await activeSafe.waitForExecution(result);
+      addLog("✅ Transaction Executed Successfully!");
+
+      setProposals(prev => prev.filter(p => p.id !== proposal.id));
+
+    } catch (e: any) {
+      console.error(e);
+      addLog(`Execution Error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- RENDER ---
 
   if (!currentUser) {
     return (
       <div className="app-container">
-        <header><h1>Safe Multi-User Demo</h1></header>
+        <header><h1>Safe Multi-Sig Demo</h1></header>
         <div className="auth-card dashboard-card">
           <h3>Select User</h3>
-          <p className="subtitle">Choose a persona to test with. Data is stored in localStorage.</p>
           <div className="action-grid">
-            <button
-              className="primary"
-              onClick={() => handleAuth(USER_1)}
-              disabled={loading}
-            >
-              {WebAuthnSigner.isRegistered(USER_1) ? `Login as ${USER_1}` : `Register ${USER_1}`}
+            <button className="primary" onClick={() => handleAuth(USER_1)}>
+              {WebAuthnSigner.isRegistered(USER_1) ? `Login ${USER_1}` : `Register ${USER_1}`}
             </button>
-            <button
-              className="primary"
-              onClick={() => handleAuth(USER_2)}
-              disabled={loading}
-            >
-              {WebAuthnSigner.isRegistered(USER_2) ? `Login as ${USER_2}` : `Register ${USER_2}`}
+            <button className="primary" onClick={() => handleAuth(USER_2)}>
+              {WebAuthnSigner.isRegistered(USER_2) ? `Login ${USER_2}` : `Register ${USER_2}`}
             </button>
           </div>
         </div>
@@ -294,98 +433,109 @@ function App() {
     );
   }
 
-  // Logged In View
   return (
     <div className="app-container">
       <header>
-        <h1>Safe Multi-User Demo</h1>
+        <h1>Safe Multi-Sig Demo</h1>
         <div className="auth-section">
           <div className="logged-in-badge">👤 {currentUser}</div>
           <button onClick={logout} className="small">Logout</button>
         </div>
       </header>
 
-      {/* SAFE LIST / CREATION */}
       {!activeSafe && (
         <div className="dashboard-card">
           <h3>My Safes</h3>
-
-          {storedSafes.length > 0 ? (
-            <div className="safe-list">
-              {storedSafes.map((safe, idx) => (
-                <div key={idx} className="status-item safe-item" onClick={() => selectSafe(safe)}>
-                  <div>
-                    <div className="safe-name">{safe.name}</div>
-                    <div className="safe-addr">{safe.address.slice(0, 8)}...{safe.address.slice(-6)}</div>
-                  </div>
-                  <button disabled={loading}>Select</button>
+          <div className="safe-list">
+            {storedSafes.map((safe, idx) => (
+              <div key={idx} className="status-item safe-item" onClick={() => selectSafe(safe)}>
+                <div>
+                  <div className="safe-name">{safe.name}</div>
+                  <div className="safe-addr">{safe.address.slice(0, 6)}...{safe.address.slice(-4)}</div>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <p className="subtitle">No Safes found locally.</p>
-          )}
+                <div style={{ fontSize: '0.8rem' }}>Threshold: {safe.threshold}/{safe.owners.length}</div>
+              </div>
+            ))}
+          </div>
 
           <hr style={{ borderColor: 'var(--border-color)', margin: '1.5rem 0' }} />
 
           <h3>Create New Safe</h3>
           <div className="create-section">
-            <div style={{ marginBottom: '1rem' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  id="addCoOwner"
-                  disabled={currentUser === USER_2 || !WebAuthnSigner.isRegistered(USER_2)}
-                />
-                <span>Add {USER_2} as signer immediately?</span>
+            <div className="form-row">
+              <label>
+                <input type="checkbox" id="addCoOwner" disabled={!WebAuthnSigner.isRegistered(USER_2)} />
+                Add {USER_2}?
               </label>
-              {currentUser !== USER_2 && !WebAuthnSigner.isRegistered(USER_2) && (
-                <small style={{ color: 'var(--text-secondary)', marginLeft: '1.5rem' }}>
-                  (Register User 2 first to enable this)
-                </small>
-              )}
+
+              <label style={{ marginLeft: '1rem' }}>
+                Threshold:
+                <input
+                  type="number"
+                  min="1"
+                  max="2"
+                  value={creationThreshold}
+                  onChange={(e) => setCreationThreshold(parseInt(e.target.value))}
+                  style={{ width: '50px', marginLeft: '0.5rem', background: '#000', color: '#fff', border: '1px solid #333' }}
+                />
+              </label>
             </div>
 
-            <button
-              className="primary"
-              onClick={() => {
-                const cb = document.getElementById('addCoOwner') as HTMLInputElement;
-                createNewSafe(cb?.checked || false);
-              }}
-              disabled={loading || isCreatingSafe}
-            >
-              {isCreatingSafe ? "Creating..." : "+ Create New Safe"}
+            <button className="primary" onClick={() => {
+              const cb = document.getElementById('addCoOwner') as HTMLInputElement;
+              createNewSafe(cb?.checked || false);
+            }} disabled={loading}>
+              Create Safe
             </button>
           </div>
         </div>
       )}
 
-      {/* ACTIVE SAFE DASHBOARD */}
-      {activeSafe && activeSafeAddress && (
-        <div className="dashboard-card">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h3>Active Safe</h3>
-            <button onClick={() => { setActiveSafe(null); setActiveSafeAddress(null); }}>Back to List</button>
+      {activeSafe && (
+        <>
+          <div className="dashboard-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <h3>Active Safe ({activeSafeThreshold}-of-N)</h3>
+              <button onClick={() => setActiveSafe(null)}>Back</button>
+            </div>
+            <div className="status-item"><span>Address:</span> <code className="address-text">{activeSafeAddress}</code></div>
+            <div className="status-item"><span>Balance:</span> <span>{balance} ETH</span></div>
+
+            <div className="action-grid" style={{ marginTop: '1rem' }}>
+              <button className="primary" onClick={createProposal} disabled={loading}>
+                {activeSafeThreshold === 1 ? "Deploy (Exec)" : "Propose Deployment"}
+              </button>
+              <button onClick={() => fetchBalance(activeSafeAddress!)}>Refresh Balance</button>
+            </div>
           </div>
 
-          <div className="address-container">
-            <span className="label">Address:</span>
-            <code className="address-text">{activeSafeAddress}</code>
-          </div>
-          <div className="status-item">
-            <span>Balance:</span>
-            <span className="status-value">{balance} ETH</span>
-          </div>
+          {/* PROPOSALS SECTION */}
+          {proposals.filter(p => p.safeAddress === activeSafeAddress).length > 0 && (
+            <div className="dashboard-card">
+              <h3>Pending Proposals</h3>
+              {proposals.filter(p => p.safeAddress === activeSafeAddress).map((p) => {
+                const hasSigned = p.signatures.find(s => s.signerName === currentUser);
+                return (
+                  <div key={p.id} className="status-item" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '0.5rem' }}>
+                    <div style={{ fontWeight: 'bold' }}>{p.description}</div>
+                    <div style={{ fontSize: '0.8rem', color: '#888' }}>Signatures: {p.signatures.length} / {activeSafeThreshold}</div>
+                    <div style={{ fontSize: '0.8rem' }}>Signed by: {p.signatures.map(s => s.signerName).join(", ")}</div>
 
-          <div className="action-grid" style={{ marginTop: '1.5rem' }}>
-            <button className="primary" onClick={deploySafe} disabled={loading}>
-              Deploy Safe
-            </button>
-            <button onClick={() => fetchBalance(activeSafeAddress)} disabled={loading}>
-              Refresh Balance
-            </button>
-          </div>
-        </div>
+                    {!hasSigned && p.signatures.length < activeSafeThreshold && (
+                      <button className="primary" onClick={() => signProposal(p)} disabled={loading}>
+                        Sign Proposal
+                      </button>
+                    )}
+
+                    {hasSigned && p.signatures.length < activeSafeThreshold && (
+                      <div style={{ color: 'var(--accent-color)' }}>Waiting for other signers...</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
       <div className="console-container">
