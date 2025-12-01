@@ -1,5 +1,3 @@
-//--- File: src/App.tsx ---
-
 import { useState, useEffect } from "react";
 import {
   type Address,
@@ -7,9 +5,12 @@ import {
   type Hex,
   toHex,
   hexToBigInt,
+  hexToBytes,
+  bytesToBigInt,
   concat
 } from "viem";
 import { toWebAuthnAccount } from "viem/account-abstraction";
+import { addOwner as addPasskeyOwner, changeThreshold } from "@rhinestone/sdk/actions/passkeys";
 import { publicClient, rhinestoneConfig } from "./clients";
 import { WebAuthnSigner } from "./passkeySigner";
 import "./App.css";
@@ -21,8 +22,10 @@ type StoredSafe = {
   name: string;
   address: Address;
   salt: Hex;
-  owners: string[];
+  genesisOwner: string; // The owner used to derive the address
+  currentOwners: string[]; // The actual owners on-chain
   threshold: number;
+  isDeployed: boolean;
 };
 
 type ProposalSignature = {
@@ -37,7 +40,7 @@ type PendingProposal = {
   calls: { to: Address; value: bigint; data: Hex }[];
   signatures: ProposalSignature[];
   nonce: string;
-  preparedUserOp: any; // Stored PreparedUserOperationData
+  preparedUserOp: any;
 };
 
 // --- CONSTANTS ---
@@ -60,6 +63,13 @@ const restoreUserOpBigInts = (op: any) => {
   return newOp;
 };
 
+const getPasskeyCoords = (publicKey: Hex) => {
+  const bytes = hexToBytes(publicKey);
+  const x = bytesToBigInt(bytes.slice(0, 32));
+  const y = bytesToBigInt(bytes.slice(32, 64));
+  return { x, y };
+};
+
 function App() {
   // Auth State
   const [currentUser, setCurrentUser] = useState<string | null>(null);
@@ -71,13 +81,13 @@ function App() {
   const [activeSafeAddress, setActiveSafeAddress] = useState<Address | null>(null);
   const [activeSafeThreshold, setActiveSafeThreshold] = useState<number>(1);
 
-  // Creation Form State
+  // Creation Form
   const [creationThreshold, setCreationThreshold] = useState(1);
 
-  // Proposals State
+  // Proposals
   const [proposals, setProposals] = useState<PendingProposal[]>([]);
 
-  // Dashboard State
+  // Dashboard
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [balance, setBalance] = useState<string>("0");
@@ -93,8 +103,6 @@ function App() {
     const savedProposals = localStorage.getItem(PROPOSALS_STORAGE_KEY);
     if (savedProposals) {
       const parsed = JSON.parse(savedProposals);
-
-      // Fix BigInts in the preparedUserOp.userOperation object
       const restored = parsed.map((p: PendingProposal) => ({
         ...p,
         preparedUserOp: {
@@ -106,7 +114,6 @@ function App() {
     }
   }, []);
 
-  // Save proposals whenever they change
   useEffect(() => {
     const serialized = JSON.stringify(proposals, (_, v) => typeof v === 'bigint' ? toHex(v) : v);
     localStorage.setItem(PROPOSALS_STORAGE_KEY, serialized);
@@ -131,7 +138,6 @@ function App() {
       setCurrentUser(username);
       addLog(`Authenticated as ${username}`);
 
-      // Reset active safe on user switch
       setActiveSafe(null);
       setActiveSafeAddress(null);
     } catch (e: any) {
@@ -148,7 +154,7 @@ function App() {
     setLogs([]);
   };
 
-  // --- 2. SAFE CREATION & SELECTION ---
+  // --- 2. SAFE CREATION (Deploy + Upgrade) ---
 
   const createNewSafe = async (addCoOwner: boolean) => {
     if (!signer || !currentUser) return;
@@ -158,48 +164,78 @@ function App() {
       const saltHex = toHex(crypto.getRandomValues(new Uint8Array(32)));
       const nonceBigInt = hexToBigInt(saltHex);
 
-      const owners: any[] = [signer];
-      const ownerNames = [currentUser];
-
-      if (addCoOwner) {
-        const user2Cred = WebAuthnSigner.getCredential(USER_2);
-        if (!user2Cred) throw new Error("User 2 not registered locally.");
-        owners.push(toWebAuthnAccount({ credential: user2Cred }));
-        ownerNames.push(USER_2);
-      }
-
-      if (creationThreshold > owners.length) {
-        throw new Error(`Threshold (${creationThreshold}) cannot be greater than owners (${owners.length})`);
-      }
-
-      const safeName = `Safe #${storedSafes.length + 1} (${creationThreshold}/${owners.length})`;
-      addLog(`Creating ${safeName}...`);
+      // 1. Initialize as 1-of-1 (Genesis Config)
+      addLog("Initializing genesis configuration (1-of-1)...");
 
       const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
         account: { type: 'safe', nonce: nonceBigInt },
         owners: {
           type: 'passkey',
-          accounts: owners,
-          threshold: creationThreshold
+          accounts: [signer],
+          threshold: 1
         },
       });
 
       const address = account.getAddress();
+      const safeName = `Safe #${storedSafes.length + 1}`;
+      addLog(`Calculated Address: ${address}`);
 
+      // 2. Prepare the calls
+      let calls: any[] = [];
+      const finalOwners = [currentUser];
+
+      if (addCoOwner) {
+        addLog("Preparing upgrade transaction (Add User 2)...");
+        const user2Cred = WebAuthnSigner.getCredential(USER_2);
+        if (!user2Cred) throw new Error("User 2 not registered locally.");
+
+        const { x, y } = getPasskeyCoords(user2Cred.publicKey as Hex);
+
+        // 🔑 FIX: Added 'false' for requireUserVerification
+        calls.push(addPasskeyOwner(x, y, false));
+        finalOwners.push(USER_2);
+      }
+
+      // Change Threshold Call (if needed)
+      if (creationThreshold > 1) {
+        addLog(`Preparing threshold upgrade to ${creationThreshold}...`);
+        calls.push(changeThreshold(creationThreshold));
+      }
+
+      // If no upgrade needed, just empty call to trigger deploy
+      if (calls.length === 0) {
+        calls.push({ to: address, value: 0n, data: "0x" });
+      }
+
+      // 3. Send Transaction (Deploy + Upgrade in one go)
+      addLog("🚀 Sending Deployment + Setup Transaction...");
+
+      const tx = await account.sendTransaction({
+        chain: publicClient.chain,
+        calls: calls,
+        sponsored: true
+      });
+
+      addLog(`Transaction sent! ID: ${tx.id}`);
+      await account.waitForExecution(tx);
+      addLog("✅ Safe Deployed & Configured!");
+
+      // 4. Save Metadata
       const newSafeMeta: StoredSafe = {
         name: safeName,
         address,
         salt: saltHex,
-        owners: ownerNames,
-        threshold: creationThreshold
+        genesisOwner: currentUser,
+        currentOwners: finalOwners,
+        threshold: creationThreshold,
+        isDeployed: true
       };
 
       const updatedSafes = [...storedSafes, newSafeMeta];
       setStoredSafes(updatedSafes);
       localStorage.setItem(SAFES_STORAGE_KEY, JSON.stringify(updatedSafes));
 
-      addLog(`Safe Created! Address: ${address}`);
       selectSafe(newSafeMeta);
 
     } catch (e: any) {
@@ -216,19 +252,21 @@ function App() {
     addLog(`Loading Safe: ${safeMeta.name}...`);
 
     try {
-      const allOwners = safeMeta.owners.map((username) => {
-        const cred = WebAuthnSigner.getCredential(username);
-        if (!cred) throw new Error(`Credential for ${username} missing`);
-        return toWebAuthnAccount({ credential: cred });
-      });
+      // 🔑 CRITICAL: Always initialize with the GENESIS owner (User 1) and Threshold 1
+      // This ensures the SDK derives the same Address and InitCode as when it was created.
+      // The on-chain state (2-of-2) is handled by our proposal logic.
+
+      const genesisCred = WebAuthnSigner.getCredential(safeMeta.genesisOwner);
+      if (!genesisCred) throw new Error("Genesis credential missing");
+      const genesisAccount = toWebAuthnAccount({ credential: genesisCred });
 
       const account = await createRhinestoneAccount({
         ...rhinestoneConfig,
         account: { type: 'safe', nonce: hexToBigInt(safeMeta.salt) },
         owners: {
           type: 'passkey',
-          accounts: allOwners,
-          threshold: safeMeta.threshold
+          accounts: [genesisAccount],
+          threshold: 1 // Keep as 1 for address derivation
         },
       });
 
@@ -239,7 +277,7 @@ function App() {
 
       setActiveSafe(account);
       setActiveSafeAddress(address);
-      setActiveSafeThreshold(safeMeta.threshold);
+      setActiveSafeThreshold(safeMeta.threshold); // Use the stored threshold for UI logic
       fetchBalance(address);
 
     } catch (e: any) {
@@ -266,10 +304,10 @@ function App() {
     setLoading(true);
 
     try {
-      addLog("Preparing deployment proposal...");
+      addLog("Preparing proposal...");
 
-      // 1. Prepare the UserOp
-      // 🔑 CRITICAL: Specify 'signers' here so the SDK knows ONLY the current user is signing this step.
+      // 1. Prepare UserOp
+      // Use current signer for preparation
       const preparedOp = await activeSafe.prepareUserOperation({
         chain: publicClient.chain,
         calls: [{ to: activeSafeAddress, value: 0n, data: "0x" as Hex }],
@@ -280,33 +318,25 @@ function App() {
         }
       });
 
-      // 2. Sign with CURRENT user
+      // 2. Sign
       addLog("Signing with current user...");
       const signedOp = await activeSafe.signUserOperation(preparedOp);
-
-      // Extract the signature (This is User 1's signature)
-      const user1Signature = signedOp.signature;
 
       const newProposal: PendingProposal = {
         id: `proposal-${Date.now()}`,
         safeAddress: activeSafeAddress,
-        description: "Deploy Safe (Initial Transaction)",
+        description: "Zero Transfer (Test)",
         calls: [{ to: activeSafeAddress, value: 0n, data: "0x" }],
-        signatures: [{ signerName: currentUser!, signature: user1Signature }],
-        // 🔑 FIX: Access nonce from nested userOperation object
+        signatures: [{ signerName: currentUser!, signature: signedOp.signature }],
         nonce: preparedOp.userOperation.nonce.toString(),
         preparedUserOp: preparedOp
       };
 
       setProposals(prev => [...prev, newProposal]);
-      addLog(`📄 Proposal created! ID: ${newProposal.id}`);
-      addLog(`Signatures: 1/${activeSafeThreshold}`);
+      addLog(`📄 Proposal created! Signatures: 1/${activeSafeThreshold}`);
 
       if (activeSafeThreshold === 1) {
-        addLog("Threshold is 1. Executing immediately...");
-        await executeProposal(newProposal, [user1Signature]);
-      } else {
-        addLog("Waiting for more signatures...");
+        await executeProposal(newProposal, [signedOp.signature]);
       }
 
     } catch (e: any) {
@@ -327,10 +357,9 @@ function App() {
 
     setLoading(true);
     try {
-      addLog(`Signing proposal ${proposal.id} as ${currentUser}...`);
+      addLog(`Signing proposal as ${currentUser}...`);
 
-      // 🔑 FIX: Clone the stored preparedOp and update the 'signers' in the transaction config
-      // This forces the SDK to use the *current* user's passkey to sign the existing Hash.
+      // 🔑 Force SDK to use current signer for this specific op
       const opForSigning = {
         ...proposal.preparedUserOp,
         transaction: {
@@ -338,24 +367,20 @@ function App() {
           signers: {
             type: 'owner',
             kind: 'passkey',
-            accounts: [signer] // Override with current signer
+            accounts: [signer]
           }
         }
       };
 
       const signedOp = await activeSafe.signUserOperation(opForSigning);
 
-      const newSignature = signedOp.signature;
-
-      // Update proposal in state
       const updatedProposals = proposals.map(p => {
         if (p.id === proposal.id) {
           const updatedP = {
             ...p,
-            signatures: [...p.signatures, { signerName: currentUser!, signature: newSignature }]
+            signatures: [...p.signatures, { signerName: currentUser!, signature: signedOp.signature }]
           };
-
-          addLog(`Signed! Total signatures: ${updatedP.signatures.length}/${activeSafeThreshold}`);
+          addLog(`Signed! Total: ${updatedP.signatures.length}/${activeSafeThreshold}`);
           return updatedP;
         }
         return p;
@@ -380,19 +405,17 @@ function App() {
   const executeProposal = async (proposal: PendingProposal, signatures: Hex[]) => {
     if (!activeSafe) return;
     setLoading(true);
-    addLog("🚀 Threshold met. Executing transaction on-chain...");
+    addLog("🚀 Executing transaction on-chain...");
 
     try {
-      // 1. Concatenate signatures for Safe
+      // Concatenate signatures
       const combinedSignature = concat(signatures);
 
-      // 2. Construct SignedUserOperationData
       const signedOpData = {
         ...proposal.preparedUserOp,
         signature: combinedSignature
       };
 
-      // 3. Submit
       const result = await activeSafe.submitUserOperation(signedOpData);
 
       addLog(`UserOp Sent! Hash: ${result.hash}`);
@@ -453,7 +476,9 @@ function App() {
                   <div className="safe-name">{safe.name}</div>
                   <div className="safe-addr">{safe.address.slice(0, 6)}...{safe.address.slice(-4)}</div>
                 </div>
-                <div style={{ fontSize: '0.8rem' }}>Threshold: {safe.threshold}/{safe.owners.length}</div>
+                <div style={{ fontSize: '0.8rem' }}>
+                  {safe.currentOwners.length} owners • {safe.threshold}-of-N
+                </div>
               </div>
             ))}
           </div>
@@ -485,7 +510,7 @@ function App() {
               const cb = document.getElementById('addCoOwner') as HTMLInputElement;
               createNewSafe(cb?.checked || false);
             }} disabled={loading}>
-              Create Safe
+              Create & Deploy Safe
             </button>
           </div>
         </div>
@@ -495,7 +520,7 @@ function App() {
         <>
           <div className="dashboard-card">
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <h3>Active Safe ({activeSafeThreshold}-of-N)</h3>
+              <h3>Active Safe ({activeSafeThreshold}-of-{storedSafes.find(s => s.address === activeSafeAddress)?.currentOwners.length})</h3>
               <button onClick={() => setActiveSafe(null)}>Back</button>
             </div>
             <div className="status-item"><span>Address:</span> <code className="address-text">{activeSafeAddress}</code></div>
@@ -503,7 +528,7 @@ function App() {
 
             <div className="action-grid" style={{ marginTop: '1rem' }}>
               <button className="primary" onClick={createProposal} disabled={loading}>
-                {activeSafeThreshold === 1 ? "Deploy (Exec)" : "Propose Deployment"}
+                Propose Zero Tx
               </button>
               <button onClick={() => fetchBalance(activeSafeAddress!)}>Refresh Balance</button>
             </div>
@@ -515,13 +540,16 @@ function App() {
               <h3>Pending Proposals</h3>
               {proposals.filter(p => p.safeAddress === activeSafeAddress).map((p) => {
                 const hasSigned = p.signatures.find(s => s.signerName === currentUser);
+                const currentSafeMeta = storedSafes.find(s => s.address === activeSafeAddress);
+                const isSigner = currentSafeMeta?.currentOwners.includes(currentUser!);
+
                 return (
                   <div key={p.id} className="status-item" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '0.5rem' }}>
                     <div style={{ fontWeight: 'bold' }}>{p.description}</div>
                     <div style={{ fontSize: '0.8rem', color: '#888' }}>Signatures: {p.signatures.length} / {activeSafeThreshold}</div>
                     <div style={{ fontSize: '0.8rem' }}>Signed by: {p.signatures.map(s => s.signerName).join(", ")}</div>
 
-                    {!hasSigned && p.signatures.length < activeSafeThreshold && (
+                    {!hasSigned && p.signatures.length < activeSafeThreshold && isSigner && (
                       <button className="primary" onClick={() => signProposal(p)} disabled={loading}>
                         Sign Proposal
                       </button>
