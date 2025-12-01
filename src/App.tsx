@@ -59,18 +59,6 @@ const TARGET_ADDRESS = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
 
 // --- HELPERS ---
 
-const debugLog = (label: string, data?: any) => {
-  if (data === undefined) {
-    console.log(`%c[DEBUG] ${label}`, "color: #00bcd4; font-weight: bold;");
-  } else {
-    console.log(
-      `%c[DEBUG] ${label}:`, "color: #00bcd4; font-weight: bold;",
-      JSON.parse(JSON.stringify(data, (_, v) => typeof v === 'bigint' ? v.toString() : v))
-    );
-  }
-};
-
-
 const restoreUserOpBigInts = (op: any) => {
   if (!op) return op;
   const bigIntFields = ['nonce', 'callGasLimit', 'verificationGasLimit', 'preVerificationGas', 'maxFeePerGas', 'maxPriorityFeePerGas', 'value'];
@@ -111,6 +99,7 @@ const checkSessionModule = async (address: Address) => {
   }
 };
 
+
 function App() {
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [signer, setSigner] = useState<WebAuthnSigner | null>(null);
@@ -126,10 +115,35 @@ function App() {
   const [hasStoredSession, setHasStoredSession] = useState(false);
 
   const [logs, setLogs] = useState<string[]>([]);
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [balance, setBalance] = useState<string>("0");
 
+  const [isAddressCopied, setIsAddressCopied] = useState(false);
+  const [isDebugCopied, setIsDebugCopied] = useState(false);
+
   const addLog = (msg: string) => setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  const addDebugLog = (msg: string) => setDebugLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+
+  const debugLog = (label: string, data?: any) => {
+    let logMessage = `[DEBUG] ${label}`;
+    if (data !== undefined) {
+      const prettyData = JSON.stringify(data, (_, v) => typeof v === 'bigint' ? v.toString() : v, 2);
+      logMessage += `:\n${prettyData}`;
+    }
+    addDebugLog(logMessage);
+  };
+
+  const handleCopy = (textToCopy: string, setCopied: (isCopied: boolean) => void) => {
+    navigator.clipboard.writeText(textToCopy).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const handleClearDebugLogs = () => {
+    setDebugLogs([]);
+  };
 
   // --- INITIALIZATION ---
 
@@ -189,6 +203,7 @@ function App() {
     setCurrentUser(null);
     setActiveSafe(null);
     setLogs([]);
+    setDebugLogs([]);
   };
 
   const createNewSafe = async (addCoOwner: boolean) => {
@@ -554,6 +569,7 @@ function App() {
 
   // --- RENDER ---
 
+  // ... (keep the `if (!currentUser)` block the same)
   if (!currentUser) {
     return (
       <div className="app-container">
@@ -585,7 +601,6 @@ function App() {
           <button onClick={logout} className="small">Logout</button>
         </div>
       </header>
-
       {!activeSafe && (
         <div className="dashboard-card">
           <h3>My Safes</h3>
@@ -643,7 +658,18 @@ function App() {
               <h3>Active Safe ({activeSafeThreshold}-of-{storedSafes.find(s => s.address === activeSafeAddress)?.currentOwners.length})</h3>
               <button onClick={() => setActiveSafe(null)}>Back</button>
             </div>
-            <div className="status-item"><span>Address:</span> <code className="address-text">{activeSafeAddress}</code></div>
+            <div className="status-item">
+              <span>Address:</span>
+              <div className="address-line">
+                <code className="address-text">{activeSafeAddress}</code>
+                <button
+                  className="copy-btn"
+                  onClick={() => handleCopy(activeSafeAddress!, setIsAddressCopied)}
+                >
+                  {isAddressCopied ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+            </div>
             <div className="status-item"><span>Balance:</span> <span>{balance} ETH</span></div>
 
             <div className="action-grid" style={{ marginTop: '1rem' }}>
@@ -665,7 +691,6 @@ function App() {
             </div>
           </div>
 
-          {/* PROPOSALS SECTION */}
           {proposals.filter(p => p.safeAddress === activeSafeAddress).length > 0 && (
             <div className="dashboard-card">
               <h3>Pending Proposals</h3>
@@ -699,6 +724,33 @@ function App() {
 
       <div className="console-container">
         {logs.map((l, i) => <div key={i} className="log-entry">{l}</div>)}
+      </div>
+
+      <div className="debug-console-container">
+        <div className="debug-console-header">
+          <h4>Debug Logs</h4>
+          <div className="debug-console-actions">
+            <button
+              className="debug-console-btn"
+              onClick={() => handleCopy(debugLogs.join('\n\n'), setIsDebugCopied)}
+              disabled={debugLogs.length === 0}
+            >
+              {isDebugCopied ? 'Copied!' : 'Copy All'}
+            </button>
+            <button
+              className="debug-console-btn"
+              onClick={handleClearDebugLogs}
+              disabled={debugLogs.length === 0}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+        <div className="debug-console-content">
+          {debugLogs.map((l, i) => (
+            <pre key={i} className="debug-log-entry">{l}</pre>
+          ))}
+        </div>
       </div>
     </div>
   );
