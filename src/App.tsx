@@ -333,40 +333,56 @@ function App() {
     setLoading(true);
 
     try {
-      debugLog("--- 1. PROPOSAL CREATION ---");
-      debugLog("Input Calls", calls);
-
-      const preparedOp = await activeSafe.prepareUserOperation({
-        chain: publicClient.chain,
-        calls: calls,
-        signers: { type: 'owner', kind: 'passkey', accounts: [signer] }
-      });
-      debugLog("SDK `prepareUserOperation` Result", preparedOp);
-
-      addLog("Signing with current user...");
-      const signedOp = await activeSafe.signUserOperation(preparedOp);
-      debugLog("SDK `signUserOperation` Result (Initial Signature)", signedOp);
-
-      const newProposal: PendingProposal = {
-        id: `prop-${Date.now()}`,
-        safeAddress: activeSafeAddress,
-        description,
-        calls,
-        signatures: [{ signerName: currentUser!, signature: signedOp.signature }],
-        nonce: preparedOp.userOperation.nonce.toString(),
-        // 👉 Store the *signed* userOp, so it carries the first signature
-        preparedUserOp: signedOp
-      };
-
-      debugLog("Saving New Proposal Object to State/Storage", newProposal);
-
-      setProposals(prev => [...prev, newProposal]);
-      addLog(`📄 Proposal Created! Sigs: 1/${activeSafeThreshold}`);
-
+      // --- NEW LOGIC: Check threshold and choose the correct path ---
       if (activeSafeThreshold === 1) {
-        await executeProposal(newProposal);
+        // --- PATH 1: Direct Execution for 1-of-1 Safes ---
+        addLog(`Threshold is 1. Executing directly: "${description}"`);
+        debugLog("--- DIRECT EXECUTION (1-of-1) ---");
+        debugLog("Input Calls", calls);
+
+        const tx = await activeSafe.sendTransaction({
+          chain: publicClient.chain,
+          calls: calls,
+          sponsored: true,
+          // The `signer` is already configured in the `activeSafe` instance,
+          // so sendTransaction knows who is authorizing this.
+        });
+
+        addLog(`Transaction Sent! Intent ID: ${tx.id}`);
+        await activeSafe.waitForExecution(tx);
+        addLog("✅ Transaction Executed Successfully!");
+
+      } else {
+        // --- PATH 2: Multi-Sig Proposal Flow for N-of-M Safes ---
+        addLog(`Threshold is >1. Creating proposal: "${description}"`);
+        debugLog("--- 1. PROPOSAL CREATION (N-of-M) ---");
+        debugLog("Input Calls", calls);
+
+        // Prepare the operation without signing it on-chain yet.
+        const preparedOp = await activeSafe.prepareUserOperation({
+          chain: publicClient.chain,
+          calls: calls,
+          signers: { type: 'owner', kind: 'passkey', accounts: [signer] }
+        });
+        debugLog("SDK `prepareUserOperation` Result", preparedOp);
+
+        const newProposal: PendingProposal = {
+          id: `prop-${Date.now()}`,
+          safeAddress: activeSafeAddress,
+          description,
+          calls,
+          signatures: [{ signerName: currentUser!, signature: "0x" as Hex }],
+          nonce: preparedOp.userOperation.nonce.toString(),
+          preparedUserOp: preparedOp
+        };
+
+        debugLog("Saving New Proposal Object to State/Storage", newProposal);
+
+        setProposals(prev => [...prev, newProposal]);
+        addLog(`📄 Proposal Created! Signatures: 1/${activeSafeThreshold}`);
       }
     } catch (e: any) {
+      console.error("Full error object:", e);
       addLog(`Error: ${e.message}`);
     } finally {
       setLoading(false);
@@ -457,35 +473,21 @@ function App() {
   };
 
   const signProposal = async (proposal: PendingProposal) => {
-    if (!activeSafe || !signer || !currentUser) return;
+    if (!activeSafe || !currentUser) return;
     if (proposal.signatures.find(s => s.signerName === currentUser)) return;
 
     setLoading(true);
     try {
-      debugLog("--- 2. SIGNING PROPOSAL ---");
+      debugLog("--- 2. SIGNING PROPOSAL (off-chain approval only) ---");
       debugLog("Proposal being signed (from state)", proposal);
-
-      const opForSigning = {
-        ...proposal.preparedUserOp,
-        transaction: {
-          ...proposal.preparedUserOp.transaction,
-          signers: { type: 'owner', kind: 'passkey', accounts: [signer] }
-        }
-      };
-      debugLog("Object passed to `signUserOperation` for current user", opForSigning);
-
-      const signedOp = await activeSafe.signUserOperation(opForSigning);
-      debugLog("SDK `signUserOperation` Result (New Signature)", signedOp);
 
       const updatedProposals = proposals.map(p => {
         if (p.id === proposal.id) {
           const updatedP = {
             ...p,
-            signatures: [...p.signatures, { signerName: currentUser!, signature: signedOp.signature }],
-            // 👉 Keep the latest aggregated userOp in the proposal
-            preparedUserOp: signedOp
+            signatures: [...p.signatures, { signerName: currentUser!, signature: "0x" as Hex }]
           };
-          debugLog("Updated proposal object with new signature", updatedP);
+          debugLog("Updated proposal object with new approval", updatedP);
           addLog(`Signed! Total: ${updatedP.signatures.length}/${activeSafeThreshold}`);
           return updatedP;
         }
@@ -513,14 +515,35 @@ function App() {
     addLog("🚀 Threshold met. Executing transaction...");
 
     try {
-      // 👉 The proposal.preparedUserOp now already has the fully aggregated signature
-      const result = await activeSafe.submitUserOperation(proposal.preparedUserOp);
+      // Build the list of passkey accounts that should actually sign on-chain.
+      const signerAccounts = proposal.signatures.map(({ signerName }) => {
+        const cred = WebAuthnSigner.getCredential(signerName);
+        if (!cred) {
+          throw new Error(`Passkey credential for ${signerName} is missing on this device.`);
+        }
+        return toWebAuthnAccount({ credential: cred });
+      });
+
+      const opForSigning = {
+        ...proposal.preparedUserOp,
+        transaction: {
+          ...proposal.preparedUserOp.transaction,
+          signers: { type: 'owner', kind: 'passkey', accounts: signerAccounts }
+        }
+      };
+      debugLog("Object passed to `signUserOperation` for execution", opForSigning);
+
+      const signedOp = await activeSafe.signUserOperation(opForSigning);
+      debugLog("SDK `signUserOperation` Result (Aggregated)", signedOp);
+
+      const result = await activeSafe.submitUserOperation(signedOp);
 
       addLog(`UserOp Sent! Hash: ${result.hash}`);
       await activeSafe.waitForExecution(result);
       addLog("✅ Transaction Executed Successfully!");
 
       setProposals(prev => prev.filter(p => p.id !== proposal.id));
+
     } catch (e: any) {
       console.error(e);
       addLog(`Execution Error: ${e.message}`);
